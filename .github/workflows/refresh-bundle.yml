@@ -39,6 +39,7 @@ jobs:
           path: |
             cache/prices.csv
             cache/holdings.json
+            cache/aum.json
             data/xetra_master.xls
             data/openfigi_cache.json
           key: etf-cache-${{ github.run_id }}

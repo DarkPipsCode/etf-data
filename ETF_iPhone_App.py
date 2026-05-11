@@ -128,8 +128,13 @@ def build_categories_summary(merged: pd.DataFrame) -> list[dict]:
     return rows
 
 
-def build_etf_records(merged: pd.DataFrame, prices: pd.DataFrame,
-                      holdings_by_ticker: dict[str, list[dict]] | None = None) -> list[dict]:
+def build_etf_records(
+    merged: pd.DataFrame,
+    prices: pd.DataFrame,
+    holdings_by_ticker: dict[str, list[dict]] | None = None,
+    aum_by_ticker: dict[str, float | None] | None = None,
+    ff_returns: dict[str, dict[str, float]] | None = None,
+) -> list[dict]:
     records = []
     for row in merged.itertuples(index=False):
         d = row._asdict()
@@ -139,12 +144,24 @@ def build_etf_records(merged: pd.DataFrame, prices: pd.DataFrame,
         ticker = d.get("yahoo_ticker") or ""
         spark = _sparkline(prices[ticker]) if ticker and ticker in prices.columns else []
         holdings = (holdings_by_ticker or {}).get(ticker, [])
+        aum = (aum_by_ticker or {}).get(ticker)
+        factor_exposure = None
+        drawdowns: list[dict] = []
+        if ticker and ticker in prices.columns:
+            series = prices[ticker].dropna()
+            if not series.empty:
+                drawdowns = top_drawdowns_for_series(series, top_n=5)
+                if ff_returns:
+                    factor_exposure = compute_factor_exposure(series, ff_returns)
         records.append({
             **meta,
             "metrics": metrics,
             "tracking": tracking,
             "sparkline": spark,
             "top_holdings": holdings,
+            "aum": aum,
+            "factor_exposure": factor_exposure,
+            "drawdowns": drawdowns,
         })
     return records
 
@@ -155,13 +172,18 @@ def write_bundle(merged: pd.DataFrame, prices: pd.DataFrame, stats, out_dir: Pat
     print("\n== Top holdings (yfinance funds_data, cached) ==")
     holdings_by_ticker = fetch_top_holdings(merged)
     holdings_index = build_holdings_index(merged, holdings_by_ticker)
+    print("\n== AUM (yfinance .info, cached) ==")
+    aum_by_ticker = fetch_aum(merged)
+    print("\n== Fama-French (for per-ETF factor regression) ==")
+    home_static = build_homepage_static(merged, prices)
+    ff_returns = _ff_factor_returns(home_static.get("factors"))
     bundle = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "universe_stats": asdict(stats),
         "categories": build_categories_summary(merged),
-        "etfs": build_etf_records(merged, prices, holdings_by_ticker),
+        "etfs": build_etf_records(merged, prices, holdings_by_ticker, aum_by_ticker, ff_returns),
         "holdings_index": holdings_index,
-        "home": build_homepage_static(merged, prices),
+        "home": home_static,
     }
     path = out_dir / "bundle.json"
     with path.open("w", encoding="utf-8") as f:
@@ -548,6 +570,199 @@ def build_holdings_index(merged: pd.DataFrame,
     print(f"  holdings_index: {len(pruned)} unique stock symbols across "
           f"{sum(len(v['etfs']) for v in pruned.values())} ETF-holdings rows")
     return pruned
+
+
+# ============================================================================
+# AUM (assets under management) — yfinance .info["totalAssets"]
+# ============================================================================
+
+AUM_CACHE = etf_pipeline.CACHE_DIR / "aum.json"
+AUM_TTL_DAYS = 14
+
+
+def _load_aum_cache() -> dict[str, dict]:
+    if AUM_CACHE.exists():
+        try:
+            return json.loads(AUM_CACHE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _save_aum_cache(c: dict[str, dict]) -> None:
+    AUM_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    AUM_CACHE.write_text(json.dumps(c, separators=(",", ":")), encoding="utf-8")
+
+
+def fetch_aum(merged: pd.DataFrame, ttl_days: int = AUM_TTL_DAYS,
+              sleep_s: float = 0.05) -> dict[str, float | None]:
+    """{ticker: aum_in_fund_currency_units}. Cached with TTL since AUM drifts slowly."""
+    from datetime import timedelta
+    import yfinance as yf
+
+    cache = _load_aum_cache()
+    now = datetime.now(timezone.utc)
+    cutoff_iso = (now - timedelta(days=ttl_days)).isoformat()
+    now_iso = now.isoformat(timespec="seconds")
+
+    tickers = sorted({t for t in merged["yahoo_ticker"].fillna("").tolist() if t})
+    needed = [t for t in tickers
+              if (not cache.get(t)) or cache[t].get("fetched_at", "") < cutoff_iso]
+    print(f"  aum: cache hit {len(tickers) - len(needed)} / {len(tickers)}, "
+          f"fetching {len(needed)} fresh")
+    if needed:
+        for i, t in enumerate(needed, 1):
+            aum = None
+            try:
+                info = yf.Ticker(t).info or {}
+                for key in ("totalAssets", "netAssets", "fundFamilyAssets"):
+                    v = info.get(key)
+                    if isinstance(v, (int, float)) and v > 0:
+                        aum = float(v)
+                        break
+            except Exception:
+                pass
+            cache[t] = {"fetched_at": now_iso, "aum": aum}
+            if i % 200 == 0:
+                _save_aum_cache(cache)
+                print(f"    aum progress: {i}/{len(needed)}")
+            time.sleep(sleep_s)
+        _save_aum_cache(cache)
+
+    return {t: cache.get(t, {}).get("aum") for t in tickers}
+
+
+# ============================================================================
+# Top drawdowns per ETF (start, trough, recovery duration)
+# ============================================================================
+
+def top_drawdowns_for_series(s: pd.Series, top_n: int = 5,
+                              min_pct: float = 0.05) -> list[dict]:
+    """Find the top_n peak-to-trough drawdowns in `s` (sorted by depth desc).
+    Returns [{start, trough, recovered, depth, duration_days, recovery_days}]."""
+    s = s.dropna()
+    if len(s) < 30:
+        return []
+    rolling_max = s.cummax()
+    dd = s / rolling_max - 1.0
+    out: list[dict] = []
+    i = 0
+    while i < len(dd):
+        if dd.iloc[i] >= -min_pct:
+            i += 1
+            continue
+        # Walk back to find peak (where rolling_max changed)
+        start_idx = i
+        while start_idx > 0 and rolling_max.iloc[start_idx] == rolling_max.iloc[start_idx - 1]:
+            start_idx -= 1
+        peak_val = rolling_max.iloc[i]
+        # Walk forward to find trough + recovery
+        j = i
+        trough_idx = i
+        trough_val = s.iloc[i]
+        recovered_idx = None
+        while j < len(s) and s.iloc[j] < peak_val:
+            if s.iloc[j] < trough_val:
+                trough_val = s.iloc[j]
+                trough_idx = j
+            j += 1
+        if j < len(s):
+            recovered_idx = j
+        depth = trough_val / peak_val - 1.0
+        if depth <= -min_pct:
+            dur = (trough_idx - start_idx)
+            rec = ((recovered_idx - trough_idx) if recovered_idx is not None else None)
+            out.append({
+                "start": str(s.index[start_idx].date()) if hasattr(s.index[start_idx], "date") else str(s.index[start_idx]),
+                "trough": str(s.index[trough_idx].date()) if hasattr(s.index[trough_idx], "date") else str(s.index[trough_idx]),
+                "recovered": (str(s.index[recovered_idx].date()) if (recovered_idx is not None and hasattr(s.index[recovered_idx], "date")) else None),
+                "depth": round(float(depth), 5),
+                "duration_days": int(dur),
+                "recovery_days": int(rec) if rec is not None else None,
+            })
+        i = j if recovered_idx is not None else j + 1
+    out.sort(key=lambda d: d["depth"])
+    return out[:top_n]
+
+
+# ============================================================================
+# Per-ETF Fama-French factor regression
+# ============================================================================
+
+def _ff_factor_returns(factors: dict | None) -> dict[str, dict[str, float]] | None:
+    """Convert the cumulative FF series into monthly returns indexed by 'YYYY-MM'."""
+    if not factors:
+        return None
+    dates = factors.get("dates") or []
+    cum = factors.get("cumulative") or {}
+    if not dates or not cum:
+        return None
+    out: dict[str, dict[str, float]] = {}
+    for f, series in cum.items():
+        for i in range(1, len(series)):
+            prev = series[i - 1]
+            cur = series[i]
+            if prev is None or cur is None or prev <= 0:
+                continue
+            ret = cur / prev - 1.0
+            out.setdefault(dates[i], {})[f] = ret
+    return out
+
+
+def compute_factor_exposure(prices: pd.Series, ff_returns: dict[str, dict[str, float]]
+                            ) -> dict | None:
+    """OLS regression of ETF monthly returns on FF factors. Returns betas + r2."""
+    if prices is None or len(prices.dropna()) < 36:
+        return None
+    monthly = prices.resample("M").last().dropna()
+    if len(monthly) < 24:
+        return None
+    rets = monthly.pct_change().dropna()
+    rows = []
+    for ts, r in rets.items():
+        ym = ts.strftime("%Y-%m")
+        ff = ff_returns.get(ym)
+        if not ff or "Mkt-RF" not in ff or "RF" not in ff:
+            continue
+        rows.append({
+            "y": r - ff["RF"],  # excess return
+            "Mkt-RF": ff["Mkt-RF"],
+            "SMB": ff.get("SMB", 0.0),
+            "HML": ff.get("HML", 0.0),
+            "RMW": ff.get("RMW", 0.0),
+            "CMA": ff.get("CMA", 0.0),
+            "Mom": ff.get("Mom", 0.0),
+        })
+    if len(rows) < 24:
+        return None
+    df = pd.DataFrame(rows).dropna()
+    if len(df) < 24:
+        return None
+    X = df[["Mkt-RF", "SMB", "HML", "RMW", "CMA", "Mom"]].values
+    y = df["y"].values
+    # Append intercept
+    X_ = np.column_stack([np.ones(len(X)), X])
+    try:
+        coef, *_ = np.linalg.lstsq(X_, y, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    y_hat = X_ @ coef
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else None
+    return {
+        "alpha_monthly": round(float(coef[0]), 6),
+        "betas": {
+            "Mkt-RF": round(float(coef[1]), 4),
+            "SMB":    round(float(coef[2]), 4),
+            "HML":    round(float(coef[3]), 4),
+            "RMW":    round(float(coef[4]), 4),
+            "CMA":    round(float(coef[5]), 4),
+            "Mom":    round(float(coef[6]), 4),
+        },
+        "r2": round(r2, 4) if r2 is not None else None,
+        "n_months": int(len(df)),
+    }
 
 
 def build_homepage_static(merged: pd.DataFrame, prices: pd.DataFrame) -> dict:
