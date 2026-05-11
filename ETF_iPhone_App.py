@@ -177,22 +177,53 @@ HOMEPAGE_PROXIES: list[tuple[str, str, str | None]] = [
 ]
 
 
+MOVER_MIN_OBS = 60               # need ≥ 3 months of daily prices
+MOVER_MAX_1D_RETURN = 0.25       # drop any series with a single-day jump > 25% (split/data glitch)
+MOVER_MAX_5D_RETURN = 0.50       # drop reported 5d returns beyond ±50% as implausible
+
+
+def _is_clean_series(s: pd.Series) -> bool:
+    """Reject a price series that looks like a corporate-action / data glitch."""
+    if len(s) < MOVER_MIN_OBS:
+        return False
+    rets = s.pct_change().dropna()
+    if rets.empty:
+        return False
+    if rets.abs().max() > MOVER_MAX_1D_RETURN:
+        return False
+    return True
+
+
 def compute_weekly_movers(merged: pd.DataFrame, prices: pd.DataFrame,
                           top_n: int = 5) -> dict:
     rows = []
+    skipped = {"no_ticker": 0, "no_history": 0, "leveraged": 0,
+               "dirty_series": 0, "implausible_return": 0}
     for r in merged.itertuples(index=False):
         d = r._asdict()
+        if d.get("leveraged"):
+            skipped["leveraged"] += 1
+            continue
         tkr = d.get("yahoo_ticker") or ""
-        if not tkr or tkr not in prices.columns:
+        if not tkr:
+            skipped["no_ticker"] += 1
+            continue
+        if tkr not in prices.columns:
+            skipped["no_history"] += 1
             continue
         s = prices[tkr].dropna()
-        if len(s) < 6:
+        if not _is_clean_series(s):
+            skipped["dirty_series"] += 1
             continue
         last = float(s.iloc[-1])
         prev = float(s.iloc[-6])
         if prev <= 0 or math.isnan(prev) or math.isnan(last):
+            skipped["dirty_series"] += 1
             continue
         ret_5d = last / prev - 1
+        if abs(ret_5d) > MOVER_MAX_5D_RETURN:
+            skipped["implausible_return"] += 1
+            continue
         rows.append({
             "isin": d.get("isin"),
             "name": d.get("name"),
@@ -201,6 +232,7 @@ def compute_weekly_movers(merged: pd.DataFrame, prices: pd.DataFrame,
             "ret_5d": round(float(ret_5d), 5),
             "ret_1y": _round(d.get("ret_1y"), 4),
         })
+    print(f"  weekly_movers: kept {len(rows)}, skipped {skipped}")
     if not rows:
         return {"best": [], "worst": []}
     rows.sort(key=lambda r: r["ret_5d"], reverse=True)
