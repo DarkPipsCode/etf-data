@@ -173,7 +173,6 @@ HOMEPAGE_PROXIES: list[tuple[str, str, str | None]] = [
     ("Gold",          "GC=F",    "Commodity - Gold"),
     ("Oil",           "CL=F",    "Commodity - Oil & Gas"),
     ("Bitcoin",       "BTC-USD", "Crypto - Bitcoin"),
-    ("US Dollar",     "DX=F",    None),
 ]
 
 
