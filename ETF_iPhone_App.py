@@ -128,7 +128,8 @@ def build_categories_summary(merged: pd.DataFrame) -> list[dict]:
     return rows
 
 
-def build_etf_records(merged: pd.DataFrame, prices: pd.DataFrame) -> list[dict]:
+def build_etf_records(merged: pd.DataFrame, prices: pd.DataFrame,
+                      holdings_by_ticker: dict[str, list[dict]] | None = None) -> list[dict]:
     records = []
     for row in merged.itertuples(index=False):
         d = row._asdict()
@@ -137,18 +138,29 @@ def build_etf_records(merged: pd.DataFrame, prices: pd.DataFrame) -> list[dict]:
         tracking = {col: _round(d.get(col), 5) for col in TRACKING_COLS if col in d}
         ticker = d.get("yahoo_ticker") or ""
         spark = _sparkline(prices[ticker]) if ticker and ticker in prices.columns else []
-        records.append({**meta, "metrics": metrics, "tracking": tracking, "sparkline": spark})
+        holdings = (holdings_by_ticker or {}).get(ticker, [])
+        records.append({
+            **meta,
+            "metrics": metrics,
+            "tracking": tracking,
+            "sparkline": spark,
+            "top_holdings": holdings,
+        })
     return records
 
 
 def write_bundle(merged: pd.DataFrame, prices: pd.DataFrame, stats, out_dir: Path,
                  also_gzip: bool = True) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
+    print("\n== Top holdings (yfinance funds_data, cached) ==")
+    holdings_by_ticker = fetch_top_holdings(merged)
+    holdings_index = build_holdings_index(merged, holdings_by_ticker)
     bundle = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "universe_stats": asdict(stats),
         "categories": build_categories_summary(merged),
-        "etfs": build_etf_records(merged, prices),
+        "etfs": build_etf_records(merged, prices, holdings_by_ticker),
+        "holdings_index": holdings_index,
         "home": build_homepage_static(merged, prices),
     }
     path = out_dir / "bundle.json"
@@ -374,6 +386,170 @@ def fetch_fama_french(start_year: int = 2000) -> dict | None:
     }
 
 
+# ============================================================================
+# Top holdings (per-ETF + reverse index by stock symbol)
+# ============================================================================
+
+HOLDINGS_CACHE = etf_pipeline.CACHE_DIR / "holdings.json"
+HOLDINGS_TTL_DAYS = 7
+
+
+def _load_holdings_cache() -> dict[str, dict]:
+    if HOLDINGS_CACHE.exists():
+        try:
+            return json.loads(HOLDINGS_CACHE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _save_holdings_cache(cache: dict[str, dict]) -> None:
+    HOLDINGS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    HOLDINGS_CACHE.write_text(json.dumps(cache, separators=(",", ":")), encoding="utf-8")
+
+
+def _fetch_one_top_holdings(ticker: str) -> list[dict]:
+    """Pull top holdings from yfinance.funds_data. Returns [] if unavailable."""
+    import yfinance as yf
+    try:
+        t = yf.Ticker(ticker)
+        fd = t.funds_data
+    except Exception:
+        return []
+    if fd is None:
+        return []
+    try:
+        df = fd.top_holdings
+    except Exception:
+        return []
+    if df is None or df.empty:
+        return []
+
+    out: list[dict] = []
+    df = df.reset_index() if df.index.name else df
+    sym_col = next((c for c in df.columns if str(c).strip().lower() in ("symbol", "ticker")), None)
+    name_col = next((c for c in df.columns
+                     if str(c).strip().lower() in ("holding name", "name", "holdingname")), None)
+    pct_col = next((c for c in df.columns
+                    if "percent" in str(c).strip().lower() or "weight" in str(c).strip().lower()),
+                   None)
+
+    for _, row in df.iterrows():
+        sym = str(row.get(sym_col, "")).strip() if sym_col else ""
+        nm = str(row.get(name_col, "")).strip() if name_col else ""
+        pct_raw = row.get(pct_col) if pct_col else None
+        try:
+            pct = float(pct_raw)
+        except (TypeError, ValueError):
+            continue
+        if pd.isna(pct):
+            continue
+        if not sym and not nm:
+            continue
+        out.append({
+            "symbol": sym or nm[:10].upper(),
+            "name": nm,
+            "weight": round(pct, 5),
+        })
+    return out
+
+
+def fetch_top_holdings(merged: pd.DataFrame, force: bool = False,
+                       ttl_days: int = HOLDINGS_TTL_DAYS,
+                       sleep_s: float = 0.05) -> dict[str, list[dict]]:
+    """Return {ticker: [{symbol, name, weight}]} for every yahoo_ticker in merged.
+
+    Uses an on-disk JSON cache (TTL = ttl_days) so the daily workflow only
+    re-fetches stale or missing entries.
+    """
+    from datetime import timedelta
+
+    cache = _load_holdings_cache()
+    now = datetime.now(timezone.utc)
+    cutoff_iso = (now - timedelta(days=ttl_days)).isoformat()
+    now_iso = now.isoformat(timespec="seconds")
+
+    tickers = [t for t in merged["yahoo_ticker"].fillna("").tolist() if t]
+    tickers = sorted(set(tickers))
+    needed = []
+    for t in tickers:
+        entry = cache.get(t)
+        if not entry or force or (entry.get("fetched_at", "") < cutoff_iso):
+            needed.append(t)
+
+    print(f"  holdings: cache hit {len(tickers) - len(needed)} / {len(tickers)}, "
+          f"fetching {len(needed)} fresh")
+
+    if needed:
+        empty = 0
+        for i, tkr in enumerate(needed, 1):
+            try:
+                holdings = _fetch_one_top_holdings(tkr)
+            except Exception:
+                holdings = []
+            if not holdings:
+                empty += 1
+            cache[tkr] = {"fetched_at": now_iso, "holdings": holdings}
+            if i % 100 == 0:
+                _save_holdings_cache(cache)
+                print(f"    progress: {i}/{len(needed)}  ({empty} empty so far)")
+            time.sleep(sleep_s)
+        _save_holdings_cache(cache)
+        print(f"  holdings: completed, {empty}/{len(needed)} returned no data")
+
+    return {t: cache.get(t, {}).get("holdings", []) for t in tickers}
+
+
+def build_holdings_index(merged: pd.DataFrame,
+                         holdings_by_ticker: dict[str, list[dict]],
+                         min_etfs_per_symbol: int = 1) -> dict:
+    """Build a reverse index { SYMBOL: [{isin, name, weight, holding_name}, ...] }
+    sorted by weight desc, so a stock-symbol search resolves in O(1) on the
+    client.
+    """
+    by_symbol: dict[str, list[dict]] = {}
+    name_by_symbol: dict[str, str] = {}
+
+    for r in merged.itertuples(index=False):
+        d = r._asdict()
+        tkr = d.get("yahoo_ticker") or ""
+        if not tkr:
+            continue
+        hl = holdings_by_ticker.get(tkr, [])
+        if not hl:
+            continue
+        isin = d.get("isin")
+        etf_name = d.get("name")
+        category = d.get("category")
+        asset_class = d.get("asset_class")
+        for h in hl:
+            sym = (h.get("symbol") or "").upper()
+            if not sym:
+                continue
+            if sym not in name_by_symbol and h.get("name"):
+                name_by_symbol[sym] = h["name"]
+            by_symbol.setdefault(sym, []).append({
+                "isin": isin,
+                "etf_name": etf_name,
+                "category": category,
+                "asset_class": asset_class,
+                "weight": h["weight"],
+            })
+
+    pruned: dict[str, dict] = {}
+    for sym, etfs in by_symbol.items():
+        if len(etfs) < min_etfs_per_symbol:
+            continue
+        etfs.sort(key=lambda x: x["weight"], reverse=True)
+        pruned[sym] = {
+            "name": name_by_symbol.get(sym, ""),
+            "etfs": etfs,
+        }
+    print(f"  holdings_index: {len(pruned)} unique stock symbols across "
+          f"{sum(len(v['etfs']) for v in pruned.values())} ETF-holdings rows")
+    return pruned
+
+
 def build_homepage_static(merged: pd.DataFrame, prices: pd.DataFrame) -> dict:
     print("\n== Homepage static data ==")
     movers = compute_weekly_movers(merged, prices)
@@ -541,7 +717,7 @@ def _flatten_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _top_etfs_for_category(df: pd.DataFrame, category_substring: str,
-                           limit: int = 3) -> list[dict]:
+                           limit: int = 5) -> list[dict]:
     cat_col = df["category"].fillna("")
     matches = df[cat_col.str.contains(re.escape(category_substring), case=False, na=False)].copy()
     if matches.empty:
@@ -579,7 +755,7 @@ def _enrich_story(story: dict, df: pd.DataFrame, default_category: str = "") -> 
     seen_categories: set[str] = set()
     impacted: list[dict] = []
     for cat_sub, flip in matched:
-        for etf in _top_etfs_for_category(df, cat_sub, limit=3):
+        for etf in _top_etfs_for_category(df, cat_sub, limit=5):
             key = etf["isin"]
             if not key or key in {e["isin"] for e in impacted}:
                 continue
@@ -592,7 +768,7 @@ def _enrich_story(story: dict, df: pd.DataFrame, default_category: str = "") -> 
 
     enriched = dict(story)
     enriched["sentiment"] = sentiment
-    enriched["impacted_etfs"] = impacted[:8]
+    enriched["impacted_etfs"] = impacted[:12]
     enriched["matched_categories"] = sorted(seen_categories)
     return enriched
 

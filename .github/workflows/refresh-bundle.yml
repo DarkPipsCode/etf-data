@@ -33,11 +33,12 @@ jobs:
 
       # Persist Xetra master + yfinance price cache between runs so we only
       # fetch new tickers and recent days, not 3000 tickers x 5y every time.
-      - name: Restore data + price caches
+      - name: Restore data + price + holdings caches
         uses: actions/cache@v4
         with:
           path: |
             cache/prices.csv
+            cache/holdings.json
             data/xetra_master.xls
             data/openfigi_cache.json
           key: etf-cache-${{ github.run_id }}
