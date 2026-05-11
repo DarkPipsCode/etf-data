@@ -25,6 +25,7 @@ import gzip
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -188,6 +189,176 @@ CATEGORY_NEWS_SITES = [
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 
 
+# ============================================================================
+# News impact analysis (sentiment + ETF mapping)
+# ============================================================================
+
+# Each rule: (regex, [(category_substring_to_match, flip_sentiment)])
+# Categories use substring matching against ETF.py's classification labels.
+IMPACT_RULES: list[tuple[re.Pattern[str], list[tuple[str, bool]]]] = [
+    # Geography — equities
+    (re.compile(r"\b(s&?p\s*500|wall\s*street|us\s+stocks?|new york stock|nyse\b|the\s+fed|federal\s+reserve|fomc)\b", re.I),
+        [("Equity - US Large Cap", False)]),
+    (re.compile(r"\bnasdaq\b", re.I), [("Equity - Nasdaq / Tech", False)]),
+    (re.compile(r"\b(russell\s*2000|us\s+small[-\s]?cap)\b", re.I), [("Equity - US Small Cap", False)]),
+    (re.compile(r"\b(ftse\s*100|ftse\s*250|uk\s+stocks?|british\s+stocks?|london stock|\bboe\b|bank of england)\b", re.I),
+        [("Equity - UK", False)]),
+    (re.compile(r"\b(euro\s+stoxx|stoxx\s*600|eurozone|european\s+stocks?|\becb\b|european central bank)\b", re.I),
+        [("Equity - Europe Broad", False)]),
+    (re.compile(r"\bdax\b|\bgermany\b|german\s+(stocks?|economy|exports?)", re.I),
+        [("Equity - Germany", False)]),
+    (re.compile(r"\b(nikkei|topix|japan(ese)?\s+(stocks?|equities|economy)|bank of japan|\bboj\b)\b", re.I),
+        [("Equity - Japan", False)]),
+    (re.compile(r"\b(csi\s*300|china(?:'s)?\s+(stocks?|economy|market)|hang\s*seng|\bhsi\b|beijing|shanghai)\b", re.I),
+        [("Equity - China", False)]),
+    (re.compile(r"\b(india(?:'s)?\s+(stocks?|economy|markets?)|\bnifty\b|\bsensex\b|\brbi\b)\b", re.I),
+        [("Equity - India", False)]),
+    (re.compile(r"\b(emerging\s+markets?|em\s+stocks?|em\s+equities)\b", re.I),
+        [("Equity - Emerging Markets", False)]),
+
+    # Sectors
+    (re.compile(r"\b(big\s+tech|tech\s+(stocks?|sector)|silicon\s+valley|apple|microsoft|google|alphabet|amazon|meta\b)\b", re.I),
+        [("Sector - Technology", False)]),
+    (re.compile(r"\b(bank(s|ing)?|wells\s+fargo|jpmorgan|jp\s+morgan|goldman|morgan\s+stanley|citi)\b", re.I),
+        [("Sector - Financials", False)]),
+    (re.compile(r"\b(pharma(ceutical)?|drug\s+(approval|trial)|fda\b|biotech)\b", re.I),
+        [("Sector - Healthcare", False), ("Thematic - Biotech", False)]),
+    (re.compile(r"\b(real\s+estate|housing\s+market|home\s+prices?|\breit\b)\b", re.I),
+        [("Sector - Real Estate", False)]),
+    (re.compile(r"\b(utilit(y|ies))\b", re.I), [("Sector - Utilities", False)]),
+
+    # Themes
+    (re.compile(r"\b(ai|artificial\s+intelligence|chatgpt|openai|nvidia|generative\s+ai)\b", re.I),
+        [("Thematic - Robotics & AI", False), ("Thematic - Semiconductors", False)]),
+    (re.compile(r"\b(semiconductor|chip\s+(maker|shortage|sales)|tsmc|asml)\b", re.I),
+        [("Thematic - Semiconductors", False)]),
+    (re.compile(r"\b(electric\s+vehicle|\bev\b|tesla|byd\b|battery|lithium)\b", re.I),
+        [("Thematic - Battery / EV", False)]),
+    (re.compile(r"\b(clean\s+energy|renewable|solar|wind\s+(power|farm))\b", re.I),
+        [("Thematic - Clean Energy", False)]),
+    (re.compile(r"\bcyber(security|attack)\b|data\s+breach", re.I),
+        [("Thematic - Cybersecurity", False)]),
+    (re.compile(r"\b(defen[cs]e|military|aerospace|nato)\b", re.I),
+        [("Thematic - Defence", False)]),
+
+    # Commodities
+    (re.compile(r"\b(oil|crude|wti|brent|opec|saudi\s+aramco)\b", re.I),
+        [("Commodity - Oil & Gas", False)]),
+    (re.compile(r"\bnatural\s+gas|lng\b", re.I), [("Commodity - Oil & Gas", False)]),
+    (re.compile(r"\bgold\b", re.I), [("Commodity - Gold", False)]),
+    (re.compile(r"\bsilver\b", re.I), [("Commodity - Silver", False)]),
+    (re.compile(r"\bcopper\b", re.I), [("Commodity - Industrial Metals", False)]),
+    (re.compile(r"\b(wheat|corn|soybean|coffee|sugar|agricultur)", re.I),
+        [("Commodity - Agriculture", False)]),
+
+    # Crypto
+    (re.compile(r"\bbitcoin|\bbtc\b", re.I), [("Crypto - Bitcoin", False)]),
+    (re.compile(r"\bethereum|\beth\b\s+(price|rally)", re.I), [("Crypto - Ethereum", False)]),
+    (re.compile(r"\b(crypto|digital\s+asset|blockchain|web3|defi\b)\b", re.I),
+        [("Crypto", False)]),
+
+    # Rates / bonds
+    (re.compile(r"\btreasur(y|ies)|10-?year\s+yield|bond\s+(market|yield)\b", re.I),
+        [("Bond - US Treasury", False), ("Bond - Aggregate", False)]),
+    (re.compile(r"\b(gilt|uk\s+bond)\b", re.I), [("Bond - UK Gilts", False)]),
+    (re.compile(r"\bhigh[-\s]?yield|junk\s+bond", re.I), [("Bond - High Yield", False)]),
+    (re.compile(r"\binflation|\bcpi\b|consumer\s+price", re.I),
+        [("Bond - Inflation-Linked", False)]),
+]
+
+POSITIVE_RE = re.compile(
+    r"\b(surge|rally|jump|gain|rise|rises|risen|soar|boom|outperform|beat|beats|"
+    r"breakthrough|approve|approved|deal|merger|upgrade|record\s+high|all[-\s]?time\s+high|"
+    r"rebound|recover|recover(s|y|ed)|strong\s+(earnings|results|growth)|profit\s+(rise|jump|surge))\b",
+    re.I,
+)
+NEGATIVE_RE = re.compile(
+    r"\b(plunge|crash|fall|falls|fell|drop|slump|tumble|tumbles|"
+    r"miss(es|ed)?\s+(earnings|estimates|forecast)?|recall|fraud|ban\b|sanction|fine|insider\s+trading|"
+    r"downgrade|lawsuit|investigat|warn(s|ing|ed)?|profit\s+warning|cut\s+(forecast|outlook|jobs|workforce)|"
+    r"layoff|bankrupt|default|sell[-\s]?off)\b",
+    re.I,
+)
+
+
+def _classify_sentiment(title: str) -> str:
+    pos = bool(POSITIVE_RE.search(title))
+    neg = bool(NEGATIVE_RE.search(title))
+    if pos and not neg:
+        return "positive"
+    if neg and not pos:
+        return "negative"
+    return "neutral"
+
+
+def _flatten_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """If df came from bundle.json, metrics is a dict column — lift it."""
+    if "metrics" in df.columns and df["metrics"].apply(lambda x: isinstance(x, dict)).any():
+        for col in ("sharpe_1y", "ret_1y", "obs_days", "vol_1y"):
+            if col not in df.columns:
+                df[col] = df["metrics"].apply(
+                    lambda m, c=col: (m or {}).get(c) if isinstance(m, dict) else None
+                )
+    return df
+
+
+def _top_etfs_for_category(df: pd.DataFrame, category_substring: str,
+                           limit: int = 3) -> list[dict]:
+    cat_col = df["category"].fillna("")
+    matches = df[cat_col.str.contains(re.escape(category_substring), case=False, na=False)].copy()
+    if matches.empty:
+        return []
+    if "sharpe_1y" in matches.columns:
+        matches["__sort"] = pd.to_numeric(matches["sharpe_1y"], errors="coerce").fillna(-1e9)
+    else:
+        matches["__sort"] = 0
+    matches = matches.sort_values("__sort", ascending=False).head(limit)
+    out = []
+    for _, row in matches.iterrows():
+        out.append({
+            "isin": row.get("isin"),
+            "name": row.get("name"),
+            "category": row.get("category"),
+            "ret_1y": _round(row.get("ret_1y"), 4),
+            "sharpe_1y": _round(row.get("sharpe_1y"), 3),
+        })
+    return out
+
+
+def _enrich_story(story: dict, df: pd.DataFrame, default_category: str = "") -> dict:
+    title = story.get("title") or ""
+    sentiment = _classify_sentiment(title)
+
+    matched: list[tuple[str, bool]] = []
+    for rx, targets in IMPACT_RULES:
+        if rx.search(title):
+            matched.extend(targets)
+
+    # If we know the news bucket's category explicitly (by_category mode), seed it.
+    if default_category:
+        matched.append((default_category, False))
+
+    seen_categories: set[str] = set()
+    impacted: list[dict] = []
+    for cat_sub, flip in matched:
+        for etf in _top_etfs_for_category(df, cat_sub, limit=3):
+            key = etf["isin"]
+            if not key or key in {e["isin"] for e in impacted}:
+                continue
+            direction = sentiment
+            if flip and sentiment in {"positive", "negative"}:
+                direction = "negative" if sentiment == "positive" else "positive"
+            etf["direction"] = direction
+            impacted.append(etf)
+        seen_categories.add(cat_sub)
+
+    enriched = dict(story)
+    enriched["sentiment"] = sentiment
+    enriched["impacted_etfs"] = impacted[:8]
+    enriched["matched_categories"] = sorted(seen_categories)
+    return enriched
+
+
 def _parse_pub_date(raw: str) -> str:
     if not raw:
         return ""
@@ -279,7 +450,8 @@ def _http_get(url: str) -> str:
     return _http_get_urllib(url)
 
 
-def fetch_top_stories(per_source: int = TOP_STORIES_PER_SOURCE,
+def fetch_top_stories(merged: pd.DataFrame,
+                      per_source: int = TOP_STORIES_PER_SOURCE,
                       sleep_s: float = 0.4) -> dict[str, list[dict]]:
     by_source: dict[str, list[dict]] = {}
     for source, url in BROADSHEET_FEEDS:
@@ -295,7 +467,7 @@ def fetch_top_stories(per_source: int = TOP_STORIES_PER_SOURCE,
         for s in stories:
             if s["url"] in seen:
                 continue
-            bucket.append(s)
+            bucket.append(_enrich_story(s, merged))
             seen.add(s["url"])
             if len(bucket) >= per_source:
                 break
@@ -320,6 +492,7 @@ def _category_query(asset_class: str, category: str) -> str:
 def fetch_category_news(merged: pd.DataFrame,
                         per_category: int = CATEGORY_STORIES,
                         sleep_s: float = 0.5) -> dict[str, list[dict]]:
+    """Pull per-(asset_class::category) stories. `merged` already flattened."""
     pairs = (
         merged[["asset_class", "category"]]
         .dropna(how="all")
@@ -350,7 +523,7 @@ def fetch_category_news(merged: pd.DataFrame,
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             print(f"  ! {key}  ->  {exc}")
             stories = []
-        by_category[key] = stories
+        by_category[key] = [_enrich_story(s, merged, default_category=cat) for s in stories]
         print(f"  {key:48s}  stories={len(stories)}")
         time.sleep(sleep_s)
     return by_category
@@ -359,8 +532,10 @@ def fetch_category_news(merged: pd.DataFrame,
 def fetch_news(merged: pd.DataFrame, out_path: Path) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    merged = _flatten_metrics(merged.copy())
+
     print("\n  -- Top stories from broadsheet RSS --")
-    top = fetch_top_stories()
+    top = fetch_top_stories(merged)
 
     print("\n  -- Per-category stories (Google News, site-filtered to broadsheets) --")
     by_cat = fetch_category_news(merged)
