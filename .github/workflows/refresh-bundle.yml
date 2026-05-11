@@ -1,0 +1,67 @@
+name: refresh-bundle
+
+on:
+  schedule:
+    - cron: "30 3 * * *"   # 03:30 UTC daily (post-close for European markets)
+  workflow_dispatch:
+    inputs:
+      refresh_prices:
+        description: "Force re-download of all prices (slow)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Persist Xetra master + yfinance price cache between runs so we only
+      # fetch new tickers and recent days, not 3000 tickers x 5y every time.
+      - name: Restore data + price caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache/prices.csv
+            data/xetra_master.xls
+            data/openfigi_cache.json
+          key: etf-cache-${{ github.run_id }}
+          restore-keys: |
+            etf-cache-
+
+      - name: Rebuild bundle
+        env:
+          OPENFIGI_API_KEY: ${{ secrets.OPENFIGI_API_KEY }}
+        run: |
+          if [ "${{ github.event.inputs.refresh_prices }}" = "true" ]; then
+            python ETF_iPhone_App.py --no-news --refresh --justetf --openfigi --out-dir .
+          else
+            python ETF_iPhone_App.py --no-news --justetf --openfigi --out-dir .
+          fi
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bundle.json bundle.json.gz
+          if git diff --cached --quiet; then
+            echo "No changes."
+          else
+            git commit -m "bundle: refresh $(date -u +'%Y-%m-%dT%H:%MZ')"
+            git push
+          fi
