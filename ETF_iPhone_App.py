@@ -611,6 +611,38 @@ def _parse_pub_date(raw: str) -> str:
     return raw
 
 
+_RSS_NS = {
+    "media": "http://search.yahoo.com/mrss/",
+    "content": "http://purl.org/rss/1.0/modules/content/",
+}
+_IMG_SRC_RE = re.compile(r"""<img[^>]+src=["']([^"']+)["']""", re.I)
+
+
+def _extract_image(item) -> str:
+    # media:content / media:thumbnail (FT, NYT, Guardian, Economist)
+    for tag in ("media:content", "media:thumbnail"):
+        el = item.find(tag, _RSS_NS)
+        if el is not None:
+            url = (el.get("url") or "").strip()
+            if url:
+                return url
+    # enclosure (CNBC, MarketWatch, WSJ)
+    enc = item.find("enclosure")
+    if enc is not None:
+        mime = (enc.get("type") or "").lower()
+        url = (enc.get("url") or "").strip()
+        if url and (mime.startswith("image/") or url.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))):
+            return url
+    # First <img> inside <description> or <content:encoded>
+    for tag in ("description", "content:encoded"):
+        el = item.find(tag, _RSS_NS) if ":" in tag else item.find(tag)
+        if el is not None and el.text:
+            m = _IMG_SRC_RE.search(el.text)
+            if m:
+                return m.group(1).strip()
+    return ""
+
+
 def _parse_rss(xml_text: str, default_source: str = "") -> list[dict]:
     try:
         root = ET.fromstring(xml_text)
@@ -634,6 +666,7 @@ def _parse_rss(xml_text: str, default_source: str = "") -> list[dict]:
             "url": link,
             "source": source,
             "published_at": _parse_pub_date(pub),
+            "image_url": _extract_image(item),
         })
     return items
 
