@@ -149,6 +149,7 @@ def write_bundle(merged: pd.DataFrame, prices: pd.DataFrame, stats, out_dir: Pat
         "universe_stats": asdict(stats),
         "categories": build_categories_summary(merged),
         "etfs": build_etf_records(merged, prices),
+        "home": build_homepage_static(merged, prices),
     }
     path = out_dir / "bundle.json"
     with path.open("w", encoding="utf-8") as f:
@@ -157,6 +158,212 @@ def write_bundle(merged: pd.DataFrame, prices: pd.DataFrame, stats, out_dir: Pat
         with path.open("rb") as src, gzip.open(path.with_suffix(".json.gz"), "wb") as dst:
             dst.writelines(src)
     return path
+
+
+# ============================================================================
+# Homepage: weekly movers, cross-asset correlation, Fama-French factors
+# ============================================================================
+
+# Asset-class proxies for the correlation heatmap. Tuple: (yahoo_ticker, category_substring).
+HOMEPAGE_PROXIES: list[tuple[str, str, str | None]] = [
+    ("US Equity",     "^GSPC",   "Equity - US Large Cap"),
+    ("World Equity",  "URTH",    "Equity - World"),
+    ("US Treasuries", "IEF",     "Bond - US Treasury"),
+    ("High Yield",    "HYG",     "Bond - High Yield"),
+    ("Gold",          "GC=F",    "Commodity - Gold"),
+    ("Oil",           "CL=F",    "Commodity - Oil & Gas"),
+    ("Bitcoin",       "BTC-USD", "Crypto - Bitcoin"),
+    ("US Dollar",     "DX=F",    None),
+]
+
+
+def compute_weekly_movers(merged: pd.DataFrame, prices: pd.DataFrame,
+                          top_n: int = 5) -> dict:
+    rows = []
+    for r in merged.itertuples(index=False):
+        d = r._asdict()
+        tkr = d.get("yahoo_ticker") or ""
+        if not tkr or tkr not in prices.columns:
+            continue
+        s = prices[tkr].dropna()
+        if len(s) < 6:
+            continue
+        last = float(s.iloc[-1])
+        prev = float(s.iloc[-6])
+        if prev <= 0 or math.isnan(prev) or math.isnan(last):
+            continue
+        ret_5d = last / prev - 1
+        rows.append({
+            "isin": d.get("isin"),
+            "name": d.get("name"),
+            "category": d.get("category"),
+            "asset_class": d.get("asset_class"),
+            "ret_5d": round(float(ret_5d), 5),
+            "ret_1y": _round(d.get("ret_1y"), 4),
+        })
+    if not rows:
+        return {"best": [], "worst": []}
+    rows.sort(key=lambda r: r["ret_5d"], reverse=True)
+    return {"best": rows[:top_n], "worst": rows[-top_n:][::-1]}
+
+
+def _top_etfs_for_label(merged: pd.DataFrame, category_substring: str | None,
+                        limit: int = 2) -> list[dict]:
+    if not category_substring:
+        return []
+    cat_col = merged["category"].fillna("")
+    matches = merged[cat_col.str.contains(re.escape(category_substring),
+                                          case=False, na=False)].copy()
+    if matches.empty:
+        return []
+    if "sharpe_1y" in matches.columns:
+        matches["__s"] = pd.to_numeric(matches["sharpe_1y"], errors="coerce").fillna(-1e9)
+    else:
+        matches["__s"] = 0
+    matches = matches.sort_values("__s", ascending=False).head(limit)
+    return [{"isin": r["isin"], "name": r["name"]} for _, r in matches.iterrows()]
+
+
+def compute_correlations(merged: pd.DataFrame, window: int = 60) -> dict:
+    tickers = [tkr for _label, tkr, _cat in HOMEPAGE_PROXIES]
+    proxy_prices = etf_pipeline.load_or_fetch_prices(tickers, period="1y")
+    if proxy_prices.empty:
+        return {"labels": [], "matrix": [], "linked_etfs": {}, "window_days": window}
+
+    available = [(label, tkr, cat) for label, tkr, cat in HOMEPAGE_PROXIES
+                 if tkr in proxy_prices.columns]
+    if not available:
+        return {"labels": [], "matrix": [], "linked_etfs": {}, "window_days": window}
+
+    cols = [tkr for _l, tkr, _c in available]
+    labels = [label for label, _t, _c in available]
+    rets = proxy_prices[cols].pct_change().dropna(how="all").tail(window)
+    if len(rets) < 10:
+        return {"labels": labels, "matrix": [], "linked_etfs": {}, "window_days": window}
+
+    rets.columns = labels
+    corr = rets.corr()
+    matrix = [
+        [None if pd.isna(corr.iloc[i, j]) else round(float(corr.iloc[i, j]), 3)
+         for j in range(len(labels))]
+        for i in range(len(labels))
+    ]
+    linked = {label: _top_etfs_for_label(merged, cat) for label, _t, cat in available}
+    return {
+        "labels": labels,
+        "matrix": matrix,
+        "linked_etfs": linked,
+        "window_days": int(len(rets)),
+    }
+
+
+FF_BASE = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp"
+FF_5_URL = f"{FF_BASE}/F-F_Research_Data_5_Factors_2x3_CSV.zip"
+FF_MOM_URL = f"{FF_BASE}/F-F_Momentum_Factor_CSV.zip"
+
+
+def _parse_ff_csv(text: str, cols: list[str], start_year: int = 2000) -> list[dict]:
+    rows = []
+    in_data = False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^(\d{6})\s*,(.*)$", line)
+        if not m:
+            if in_data:
+                break  # end of monthly section
+            continue
+        in_data = True
+        date_str = m.group(1)
+        vals = [v.strip() for v in m.group(2).split(",")]
+        year = int(date_str[:4])
+        mo = int(date_str[4:])
+        if year < start_year:
+            continue
+        row: dict = {"date": f"{year:04d}-{mo:02d}"}
+        for i, c in enumerate(cols):
+            try:
+                row[c] = float(vals[i]) / 100.0
+            except (ValueError, IndexError):
+                row[c] = None
+        rows.append(row)
+    return rows
+
+
+def _fetch_ff_zip_csv(url: str) -> str:
+    import io
+    import zipfile
+    raw = _http_get_bytes(url)
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        for name in z.namelist():
+            if name.lower().endswith(".csv"):
+                return z.read(name).decode("latin-1")
+    return ""
+
+
+def fetch_fama_french(start_year: int = 2000) -> dict | None:
+    try:
+        five_text = _fetch_ff_zip_csv(FF_5_URL)
+        mom_text = _fetch_ff_zip_csv(FF_MOM_URL)
+    except Exception as exc:
+        print(f"  ! Fama-French fetch failed: {exc}")
+        return None
+
+    five = _parse_ff_csv(five_text, ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"], start_year)
+    mom = _parse_ff_csv(mom_text, ["Mom"], start_year)
+    if not five:
+        return None
+
+    mom_by_date = {r["date"]: r.get("Mom") for r in mom}
+    factor_names = ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "Mom"]
+    cumulative: dict[str, list] = {f: [] for f in factor_names}
+    base: dict[str, float] = {f: 100.0 for f in factor_names}
+    dates: list[str] = []
+
+    for r in five:
+        dates.append(r["date"])
+        mom_val = mom_by_date.get(r["date"])
+        values = {**r, "Mom": mom_val}
+        for f in factor_names:
+            v = values.get(f)
+            if v is None:
+                cumulative[f].append(cumulative[f][-1] if cumulative[f] else 100.0)
+            else:
+                base[f] *= (1.0 + v)
+                cumulative[f].append(round(base[f], 2))
+
+    return {
+        "source": "Ken French Data Library",
+        "frequency": "monthly",
+        "from": dates[0] if dates else None,
+        "to": dates[-1] if dates else None,
+        "dates": dates,
+        "cumulative": cumulative,
+    }
+
+
+def build_homepage_static(merged: pd.DataFrame, prices: pd.DataFrame) -> dict:
+    print("\n== Homepage static data ==")
+    movers = compute_weekly_movers(merged, prices)
+    print(f"  weekly movers: {len(movers['best'])} best, {len(movers['worst'])} worst")
+
+    correlations = compute_correlations(merged)
+    print(f"  correlations: {len(correlations.get('labels', []))} assets, "
+          f"window={correlations.get('window_days')}")
+
+    factors = fetch_fama_french(start_year=2000)
+    if factors:
+        print(f"  factors: {factors['from']} → {factors['to']}, "
+              f"{len(factors['dates'])} months")
+    else:
+        print("  factors: unavailable")
+
+    return {
+        "weekly_movers": movers,
+        "correlations": correlations,
+        "factors": factors,
+    }
 
 
 # ============================================================================
@@ -450,6 +657,41 @@ def _http_get(url: str) -> str:
     return _http_get_urllib(url)
 
 
+def _http_get_bytes_urllib(url: str) -> bytes:
+    req = urllib.request.Request(url, headers=HTTP_HEADERS)
+    with urllib.request.urlopen(req, timeout=NEWS_TIMEOUT * 2) as resp:
+        return resp.read()
+
+
+def _http_get_bytes_powershell(url: str) -> bytes:
+    ps = (
+        "$ProgressPreference='SilentlyContinue';"
+        "$ErrorActionPreference='Stop';"
+        "$r = Invoke-WebRequest -UseBasicParsing "
+        "  -UserAgent $env:HTTP_UA "
+        f"  -TimeoutSec {NEWS_TIMEOUT * 2} "
+        "  -Uri $env:HTTP_URL;"
+        "[Console]::OpenStandardOutput().Write($r.RawContentStream.ToArray(), 0, "
+        "  [int]$r.RawContentStream.Length)"
+    )
+    env = {**os.environ, "HTTP_URL": url, "HTTP_UA": HTTP_HEADERS["User-Agent"],
+           "PYTHONIOENCODING": "utf-8"}
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+        capture_output=True, timeout=NEWS_TIMEOUT * 2 + 10, env=env,
+    )
+    if result.returncode != 0:
+        raise OSError(f"powershell http bytes failed ({result.returncode}): "
+                      f"{result.stderr.decode('utf-8', errors='replace').strip()}")
+    return result.stdout
+
+
+def _http_get_bytes(url: str) -> bytes:
+    if _USE_POWERSHELL_HTTP:
+        return _http_get_bytes_powershell(url)
+    return _http_get_bytes_urllib(url)
+
+
 def fetch_top_stories(merged: pd.DataFrame,
                       per_source: int = TOP_STORIES_PER_SOURCE,
                       sleep_s: float = 0.4) -> dict[str, list[dict]]:
@@ -529,6 +771,125 @@ def fetch_category_news(merged: pd.DataFrame,
     return by_category
 
 
+FORWARD_LOOKING_RE = re.compile(
+    r"\b(ahead\s+of|set\s+to|preview|coming\s+(week|days|month)|"
+    r"will\s+(release|decide|announce|publish|cut|raise|hike|hold|meet|address)|"
+    r"next\s+(week|month|meeting|wednesday|thursday|friday)|"
+    r"due\s+(out|to)|expected\s+to|outlook\s+for|"
+    r"fed\s+(meeting|decision|minutes)|ecb\s+(meeting|decision|to\s+meet)|"
+    r"fomc|cpi\s+(report|release|print|data)|jobs?\s+report|payrolls?\b|"
+    r"\bnfp\b|earnings\s+(preview|expected|due|season)|to\s+report|"
+    r"\b(monday|tuesday|wednesday|thursday|friday)\b)\b",
+    re.I,
+)
+
+
+def scan_upcoming_events(top_by_source: dict[str, list[dict]],
+                         max_items: int = 10) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for stories in top_by_source.values():
+        for s in stories:
+            url = s.get("url") or ""
+            if url in seen:
+                continue
+            title = s.get("title") or ""
+            if not FORWARD_LOOKING_RE.search(title):
+                continue
+            seen.add(url)
+            out.append({
+                "title": title,
+                "url": url,
+                "source": s.get("source"),
+                "published_at": s.get("published_at"),
+                "sentiment": s.get("sentiment"),
+                "impacted_etfs": (s.get("impacted_etfs") or [])[:3],
+                "matched_categories": s.get("matched_categories") or [],
+            })
+    out.sort(key=lambda e: e.get("published_at") or "", reverse=True)
+    return out[:max_items]
+
+
+def pick_market_movers(top_by_source: dict[str, list[dict]],
+                       max_items: int = 5) -> list[dict]:
+    """Top stories ranked by breadth of likely impact (impacted_etfs count) and sentiment != neutral."""
+    pool: list[dict] = []
+    seen: set[str] = set()
+    for stories in top_by_source.values():
+        for s in stories:
+            url = s.get("url") or ""
+            if url in seen:
+                continue
+            seen.add(url)
+            impact = len(s.get("impacted_etfs") or [])
+            sentiment = s.get("sentiment") or "neutral"
+            if impact == 0 or sentiment == "neutral":
+                continue
+            pool.append({
+                "title": s.get("title"),
+                "url": url,
+                "source": s.get("source"),
+                "published_at": s.get("published_at"),
+                "sentiment": sentiment,
+                "impacted_etfs": (s.get("impacted_etfs") or [])[:4],
+                "matched_categories": s.get("matched_categories") or [],
+                "_score": impact,
+            })
+    pool.sort(key=lambda e: (e["_score"], e.get("published_at") or ""), reverse=True)
+    for e in pool:
+        e.pop("_score", None)
+    return pool[:max_items]
+
+
+# X / Twitter mentions via Nitter (unofficial mirror). Often flaky — we try
+# several instances and silently fall back to empty if all fail.
+NITTER_INSTANCES = [
+    "nitter.privacydev.net",
+    "nitter.poast.org",
+    "nitter.net",
+    "nitter.tiekoetter.com",
+    "nitter.holo-mix.com",
+]
+NITTER_ACCOUNTS = [
+    "LizAnnSonders", "lisaabramowicz1", "SoberLook", "charliebilello",
+    "MichaelKantro", "biancoresearch", "M_McDonough", "JeffWeniger",
+    "FT", "WSJmarkets", "EconomistFinance",
+]
+
+
+def fetch_nitter_mentions(accounts: list[str] = NITTER_ACCOUNTS,
+                          per_account: int = 3,
+                          max_age_h: int = 36) -> list[dict]:
+    out: list[dict] = []
+    now = datetime.now(timezone.utc)
+    for handle in accounts:
+        for inst in NITTER_INSTANCES:
+            try:
+                xml = _http_get(f"https://{inst}/{handle}/rss")
+            except Exception:
+                continue
+            items = _parse_rss(xml, default_source=f"@{handle}")
+            if not items:
+                continue
+            kept = 0
+            for it in items:
+                pub = it.get("published_at", "")
+                try:
+                    t = datetime.fromisoformat(pub) if pub else now
+                    age_h = (now - t).total_seconds() / 3600
+                    if age_h > max_age_h:
+                        continue
+                except ValueError:
+                    pass
+                out.append({**it, "handle": handle})
+                kept += 1
+                if kept >= per_account:
+                    break
+            break  # successful instance, stop trying others for this handle
+    out.sort(key=lambda x: x.get("published_at") or "", reverse=True)
+    return out
+
+
 def fetch_news(merged: pd.DataFrame, out_path: Path) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -540,11 +901,24 @@ def fetch_news(merged: pd.DataFrame, out_path: Path) -> Path:
     print("\n  -- Per-category stories (Google News, site-filtered to broadsheets) --")
     by_cat = fetch_category_news(merged)
 
+    print("\n  -- Homepage news sections --")
+    upcoming = scan_upcoming_events(top)
+    print(f"  upcoming events: {len(upcoming)}")
+    movers = pick_market_movers(top)
+    print(f"  market movers: {len(movers)}")
+    x_posts = fetch_nitter_mentions()
+    print(f"  X mentions: {len(x_posts)} (Nitter is flaky; 0 is normal)")
+
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "sources": [s for s, _ in BROADSHEET_FEEDS],
         "top_stories_by_source": top,
         "by_category": by_cat,
+        "home": {
+            "upcoming_events": upcoming,
+            "market_movers": movers,
+            "x_mentions": x_posts,
+        },
     }
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
