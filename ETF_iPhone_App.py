@@ -922,6 +922,46 @@ def compute_technicals_for_ticker(prices: pd.Series) -> dict | None:
     }
 
 
+def compute_buy_sell_score(tech: dict) -> dict:
+    """Aggregate the per-ETF technicals dict into composite buy/sell scores.
+
+    Each named bullish/bearish reason contributes +1 to the relevant column.
+    Returns {buy_score, sell_score, net, buy_reasons[], sell_reasons[]}.
+    """
+    signals = set(tech.get("signals") or [])
+    rs3 = tech.get("rolling_sharpe_3m")
+    rs3 = rs3 if (rs3 is not None and not (isinstance(rs3, float) and math.isnan(rs3))) else 0.0
+
+    buy_reasons: list[str] = []
+    sell_reasons: list[str] = []
+
+    if "golden_cross_recent" in signals:    buy_reasons.append("golden_cross")
+    if "macd_bullish_cross" in signals:     buy_reasons.append("macd_bull")
+    if "new_52w_high" in signals:           buy_reasons.append("52w_high")
+    if "bollinger_upper" in signals:        buy_reasons.append("bb_breakout")
+    if "rsi_oversold" in signals:           buy_reasons.append("rsi_oversold")
+    if rs3 > 1.5:                           buy_reasons.append("strong_sharpe_3m")
+    if "strong_trend" in signals and rs3 > 0:
+        buy_reasons.append("trend_up")
+
+    if "death_cross_recent" in signals:     sell_reasons.append("death_cross")
+    if "macd_bearish_cross" in signals:     sell_reasons.append("macd_bear")
+    if "new_52w_low" in signals:            sell_reasons.append("52w_low")
+    if "bollinger_lower" in signals:        sell_reasons.append("bb_breakdown")
+    if "rsi_overbought" in signals:         sell_reasons.append("rsi_overbought")
+    if rs3 < -1.5:                          sell_reasons.append("weak_sharpe_3m")
+    if "strong_trend" in signals and rs3 < 0:
+        sell_reasons.append("trend_down")
+
+    return {
+        "buy_score": len(buy_reasons),
+        "sell_score": len(sell_reasons),
+        "net": len(buy_reasons) - len(sell_reasons),
+        "buy_reasons": buy_reasons,
+        "sell_reasons": sell_reasons,
+    }
+
+
 def build_technicals_leaderboards(merged: pd.DataFrame, prices: pd.DataFrame,
                                   per_list: int = 12) -> tuple[dict, dict[str, dict]]:
     """Returns (leaderboards, by_ticker)."""
@@ -979,7 +1019,42 @@ def build_technicals_leaderboards(merged: pd.DataFrame, prices: pd.DataFrame,
         rows.sort(key=lambda x: x[1], reverse=desc)
         return [_entry(tkr, val) for tkr, val in rows[:limit]]
 
+    # Composite buy / sell scoring across all signals
+    scored: list[tuple[str, dict]] = []
+    for tkr, tech in by_ticker.items():
+        score = compute_buy_sell_score(tech)
+        # Stash on the per-ticker dict so the per-ETF block carries it too
+        tech["buy_sell"] = score
+        scored.append((tkr, score))
+
+    def _verdict_entry(tkr: str, score: dict, kind: str) -> dict:
+        return {
+            "isin": isin_by_tkr.get(tkr),
+            "name": name_by_tkr.get(tkr),
+            "category": cat_by_tkr.get(tkr),
+            "asset_class": ac_by_tkr.get(tkr),
+            "value": score["net"] if kind == "buy" else -score["net"],
+            "buy_score": score["buy_score"],
+            "sell_score": score["sell_score"],
+            "reasons": score["buy_reasons"] if kind == "buy" else score["sell_reasons"],
+        }
+
+    buys = sorted(
+        [(t, s) for t, s in scored if s["buy_score"] >= 2 and s["net"] >= 2],
+        key=lambda x: (x[1]["net"], x[1]["buy_score"]),
+        reverse=True,
+    )
+    sells = sorted(
+        [(t, s) for t, s in scored if s["sell_score"] >= 2 and s["net"] <= -2],
+        key=lambda x: (x[1]["net"], -x[1]["sell_score"]),
+    )
+
+    top_buys = [_verdict_entry(t, s, "buy") for t, s in buys[:per_list]]
+    top_sells = [_verdict_entry(t, s, "sell") for t, s in sells[:per_list]]
+
     leaderboards = {
+        "top_buys":  top_buys,
+        "top_sells": top_sells,
         "top_rolling_sharpe_3m": _rank("rolling_sharpe_3m", desc=True),
         "top_rolling_sharpe_6m": _rank("rolling_sharpe_6m", desc=True),
         "overbought":            _signal_list("rsi_overbought", sort_key="rsi_14", desc=True),
