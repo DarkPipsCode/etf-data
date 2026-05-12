@@ -684,6 +684,9 @@ RULES: list[Rule] = [
     Rule("Thematic - Blockchain",      "Thematic", _r(r"blockchain|metaverse|web3|nft")),
     Rule("Thematic - Healthcare Innovation", "Thematic", _r(r"digital\s+health|healthcare\s+innovation|aging|longevity")),
     Rule("Thematic - Travel & Leisure","Thematic", _r(r"travel|leisure|gaming|esports")),
+    Rule("Thematic - Fintech",         "Thematic", _r(r"\bfintech\b|digital\s+payment|payment\s+(innov|tech)|digital\s+bank|neobank")),
+    Rule("Thematic - Smart Cities",    "Thematic", _r(r"smart\s+cit|smart\s+infrastructure|resilient\s+future|future\s+cit|urbani[sz]")),
+    Rule("Thematic - Innovation",      "Thematic", _r(r"\binnovat")),
     Rule("Thematic - Other",           "Thematic", _r(r"thematic|disruptive|next\s+gen|future\s+of")),
 
     Rule("Sector - Technology",        "Sector", _r(r"\btechnology|info\s*tech|technology\s+sector|\bit\s+sector")),
@@ -697,7 +700,7 @@ RULES: list[Rule] = [
     Rule("Sector - Materials",         "Sector", _r(r"basic\s+materials|materials\b|mining|metals\s+&\s+mining")),
     Rule("Sector - Communication",     "Sector", _r(r"communication\s+services|telecom|media\b")),
 
-    Rule("Equity - World",             "Equity Broad", _r(r"\bmsci\s+world\b|ftse\s+(developed|all-?world)|world\s+(equity|index)|\bacwi\b|\bworld\b(?!.*small)")),
+    Rule("Equity - World",             "Equity Broad", _r(r"\bmsci\s+world\b(?!\s+small)|ftse\s+(?:developed\s+world|all[-\s]?world)|world\s+(?:equity|index|all\s*cap)|\bacwi\b|developed\s+markets?\s+(?:equity|index|all\s*cap)|global\s+(?:equity|developed)")),
     Rule("Equity - World Small Cap",   "Equity Broad", _r(r"world\s+small|developed\s+small")),
     Rule("Equity - US Large Cap",      "Equity Broad", _r(r"\bs&?p\s*500|russell\s*1000|msci\s+usa(?!\s+small)|us\s+large")),
     Rule("Equity - US Total",          "Equity Broad", _r(r"crsp\s+us|russell\s+3000|us\s+total\s+market")),
