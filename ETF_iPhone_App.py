@@ -362,6 +362,62 @@ def _is_clean_series(s: pd.Series) -> bool:
     return True
 
 
+def compute_90d_zscore(series: pd.Series) -> float | None:
+    """Z-score of the *current* 90-day return vs the historical distribution of
+    rolling 90-day returns for this ETF.
+
+    > 2  → today's 90d move is unusually hot for this asset
+    < -2 → today's 90d move is unusually cold for this asset
+    Near 0 → typical 90d behaviour
+    """
+    s = series.dropna()
+    if len(s) < 250:           # need a year+ of history for the distribution to mean anything
+        return None
+    rolling_90 = s.pct_change(90).dropna()
+    if len(rolling_90) < 60:
+        return None
+    current = float(rolling_90.iloc[-1])
+    mean = float(rolling_90.mean())
+    std = float(rolling_90.std())
+    if std <= 0 or math.isnan(std):
+        return None
+    z = (current - mean) / std
+    if math.isnan(z) or math.isinf(z):
+        return None
+    return z
+
+
+def compute_zscore_movers(merged: pd.DataFrame, prices: pd.DataFrame,
+                          top_n: int = 5) -> dict:
+    """Return {hot: [...], cold: [...]} ranked by 90d z-score, leveraged excluded."""
+    rows = []
+    for r in merged.itertuples(index=False):
+        d = r._asdict()
+        if d.get("leveraged"):
+            continue
+        tkr = d.get("yahoo_ticker") or ""
+        if not tkr or tkr not in prices.columns:
+            continue
+        z = compute_90d_zscore(prices[tkr])
+        if z is None:
+            continue
+        ret_90d = float(prices[tkr].dropna().pct_change(90).iloc[-1])
+        if math.isnan(ret_90d):
+            continue
+        rows.append({
+            "isin": d.get("isin"),
+            "name": d.get("name"),
+            "category": d.get("category"),
+            "asset_class": d.get("asset_class"),
+            "zscore_90d": round(z, 2),
+            "ret_90d": round(ret_90d, 4),
+        })
+    if not rows:
+        return {"hot": [], "cold": []}
+    rows.sort(key=lambda x: x["zscore_90d"], reverse=True)
+    return {"hot": rows[:top_n], "cold": rows[-top_n:][::-1]}
+
+
 def compute_weekly_movers(merged: pd.DataFrame, prices: pd.DataFrame,
                           top_n: int = 5) -> dict:
     rows = []
@@ -1308,6 +1364,9 @@ def build_homepage_static(merged: pd.DataFrame, prices: pd.DataFrame) -> dict:
     movers = compute_weekly_movers(merged, prices)
     print(f"  weekly movers: {len(movers['best'])} best, {len(movers['worst'])} worst")
 
+    zmovers = compute_zscore_movers(merged, prices)
+    print(f"  zscore movers: {len(zmovers['hot'])} hot, {len(zmovers['cold'])} cold")
+
     correlations = compute_correlations(merged)
     print(f"  correlations: {len(correlations.get('labels', []))} assets, "
           f"window={correlations.get('window_days')}")
@@ -1321,6 +1380,7 @@ def build_homepage_static(merged: pd.DataFrame, prices: pd.DataFrame) -> dict:
 
     return {
         "weekly_movers": movers,
+        "zscore_movers": zmovers,
         "correlations": correlations,
         "factors": factors,
     }
