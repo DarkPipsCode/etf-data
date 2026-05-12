@@ -173,6 +173,16 @@ def build_etf_records(
 def write_bundle(merged: pd.DataFrame, prices: pd.DataFrame, stats, out_dir: Path,
                  also_gzip: bool = True) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
+    print("\n== Data quality filter (drop ETFs with implausible 1-day jumps) ==")
+    n_before = len(merged)
+    merged, dirty_dropped = filter_dirty_universe(merged, prices)
+    print(f"  kept {len(merged)} / {n_before}  (dropped {len(dirty_dropped)} "
+          f"with 1d move > {DIRTY_1D_THRESHOLD*100:.0f}%)")
+    for d in dirty_dropped[:10]:
+        print(f"    {d['ticker']:14s}  max_1d={d['max_1d_return']:+.1%}  {(d['name'] or '')[:70]}")
+    if len(dirty_dropped) > 10:
+        print(f"    … and {len(dirty_dropped) - 10} more")
+
     print("\n== Top holdings (yfinance funds_data, cached) ==")
     holdings_by_ticker = fetch_top_holdings(merged)
     holdings_index = build_holdings_index(merged, holdings_by_ticker)
@@ -221,6 +231,45 @@ HOMEPAGE_PROXIES: list[tuple[str, str, str | None]] = [
 MOVER_MIN_OBS = 60               # need ≥ 3 months of daily prices
 MOVER_MAX_1D_RETURN = 0.25       # drop any series with a single-day jump > 25% (split/data glitch)
 MOVER_MAX_5D_RETURN = 0.50       # drop reported 5d returns beyond ±50% as implausible
+
+# Universal data-quality threshold: any ETF whose cached price series shows a
+# single-day move beyond this is excluded from the entire app (almost always a
+# split or stale dividend print rather than a real move).
+DIRTY_1D_THRESHOLD = 0.30
+
+
+def _has_dirty_jump(series: pd.Series, threshold: float = DIRTY_1D_THRESHOLD) -> bool:
+    rets = series.pct_change().dropna()
+    if rets.empty:
+        return False
+    return float(rets.abs().max()) > threshold
+
+
+def filter_dirty_universe(merged: pd.DataFrame, prices: pd.DataFrame,
+                          threshold: float = DIRTY_1D_THRESHOLD,
+                          ) -> tuple[pd.DataFrame, list[dict]]:
+    """Drop ETFs whose price series contains implausible single-day moves
+    (splits, dividend errors, stale prints). Returns (clean_merged, dropped[])."""
+    dropped: list[dict] = []
+    keep: list[bool] = []
+    for _, row in merged.iterrows():
+        tkr = row.get("yahoo_ticker") or ""
+        if not tkr or tkr not in prices.columns:
+            keep.append(True)
+            continue
+        s = prices[tkr].dropna()
+        if _has_dirty_jump(s, threshold):
+            max_jump = float(s.pct_change().dropna().abs().max())
+            dropped.append({
+                "isin": row.get("isin"),
+                "name": row.get("name"),
+                "ticker": tkr,
+                "max_1d_return": round(max_jump, 4),
+            })
+            keep.append(False)
+        else:
+            keep.append(True)
+    return merged.loc[keep].reset_index(drop=True), dropped
 
 
 def _is_clean_series(s: pd.Series) -> bool:
