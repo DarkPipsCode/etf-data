@@ -173,21 +173,16 @@ def build_etf_records(
 def write_bundle(merged: pd.DataFrame, prices: pd.DataFrame, stats, out_dir: Path,
                  also_gzip: bool = True) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    print("\n== Data quality filter (layered: trim listing window → z-score → reversion) ==")
+    # Smart price filter has already been applied upstream in build_merged so
+    # every metric, technical, sparkline and score in this universe is computed
+    # from cleaned series. (Defensive re-check in case write_bundle is called
+    # from a path that bypassed build_merged.)
     n_before = len(merged)
     merged, prices, dirty_dropped = filter_dirty_universe(merged, prices)
-    print(f"  kept {len(merged)} / {n_before}  (dropped {len(dirty_dropped)})")
-    # Group by reason for visibility
-    by_reason: dict[str, int] = {}
-    for d in dirty_dropped:
-        by_reason[d["reason"]] = by_reason.get(d["reason"], 0) + 1
-    for reason, count in sorted(by_reason.items(), key=lambda x: -x[1]):
-        print(f"    {reason:30s}  {count}")
-    for d in dirty_dropped[:10]:
-        print(f"    {d['ticker']:14s}  max_1d={d['max_1d_return']:+.1%}  "
-              f"reason={d['reason']:30s}  {(d['name'] or '')[:55]}")
-    if len(dirty_dropped) > 10:
-        print(f"    … and {len(dirty_dropped) - 10} more")
+    if dirty_dropped:
+        print(f"\n== Data quality re-check: dropped {len(dirty_dropped)} more ==")
+    elif n_before > 0:
+        print(f"\n== Data quality re-check: {n_before} ETFs all clean ==")
 
     print("\n== Top holdings (yfinance funds_data, cached) ==")
     holdings_by_ticker = fetch_top_holdings(merged)
@@ -2027,6 +2022,20 @@ def build_merged(args: argparse.Namespace):
         refresh=args.refresh,
     )
     print(f"  Got prices for {prices.shape[1]} tickers, {prices.shape[0]} days")
+
+    print("\n== Smart price filter (layered: trim listing → 6σ → reversion) ==")
+    n_before = len(pricing_pool)
+    pricing_pool, prices, dirty_dropped = filter_dirty_universe(pricing_pool, prices)
+    print(f"  kept {len(pricing_pool)} / {n_before}  (dropped {len(dirty_dropped)})")
+    by_reason: dict[str, int] = {}
+    for d in dirty_dropped:
+        by_reason[d["reason"]] = by_reason.get(d["reason"], 0) + 1
+    for reason, count in sorted(by_reason.items(), key=lambda x: -x[1]):
+        print(f"    {reason:30s}  {count}")
+    # Drop the now-empty (dropped) columns from prices DataFrame so compute_metrics
+    # doesn't waste cycles on them.
+    keep_tickers = set(pricing_pool["yahoo_ticker"].tolist())
+    prices = prices.loc[:, [c for c in prices.columns if c in keep_tickers]]
 
     print("\n== Computing metrics ==")
     metrics = etf_pipeline.compute_metrics(prices, rf_annual=args.rf)
