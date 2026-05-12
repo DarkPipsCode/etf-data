@@ -173,13 +173,19 @@ def build_etf_records(
 def write_bundle(merged: pd.DataFrame, prices: pd.DataFrame, stats, out_dir: Path,
                  also_gzip: bool = True) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    print("\n== Data quality filter (drop ETFs with implausible 1-day jumps) ==")
+    print("\n== Data quality filter (layered: trim listing window → z-score → reversion) ==")
     n_before = len(merged)
-    merged, dirty_dropped = filter_dirty_universe(merged, prices)
-    print(f"  kept {len(merged)} / {n_before}  (dropped {len(dirty_dropped)} "
-          f"with 1d move > {DIRTY_1D_THRESHOLD*100:.0f}%)")
+    merged, prices, dirty_dropped = filter_dirty_universe(merged, prices)
+    print(f"  kept {len(merged)} / {n_before}  (dropped {len(dirty_dropped)})")
+    # Group by reason for visibility
+    by_reason: dict[str, int] = {}
+    for d in dirty_dropped:
+        by_reason[d["reason"]] = by_reason.get(d["reason"], 0) + 1
+    for reason, count in sorted(by_reason.items(), key=lambda x: -x[1]):
+        print(f"    {reason:30s}  {count}")
     for d in dirty_dropped[:10]:
-        print(f"    {d['ticker']:14s}  max_1d={d['max_1d_return']:+.1%}  {(d['name'] or '')[:70]}")
+        print(f"    {d['ticker']:14s}  max_1d={d['max_1d_return']:+.1%}  "
+              f"reason={d['reason']:30s}  {(d['name'] or '')[:55]}")
     if len(dirty_dropped) > 10:
         print(f"    … and {len(dirty_dropped) - 10} more")
 
@@ -232,44 +238,116 @@ MOVER_MIN_OBS = 60               # need ≥ 3 months of daily prices
 MOVER_MAX_1D_RETURN = 0.25       # drop any series with a single-day jump > 25% (split/data glitch)
 MOVER_MAX_5D_RETURN = 0.50       # drop reported 5d returns beyond ±50% as implausible
 
-# Universal data-quality threshold: any ETF whose cached price series shows a
-# single-day move beyond this is excluded from the entire app (almost always a
-# split or stale dividend print rather than a real move).
-DIRTY_1D_THRESHOLD = 0.30
+# Layered data-quality cleanup. Three checks per series:
+#   (1) trim the first 30 trading days where listing artefacts (zero-prints,
+#       placeholder closes) inflate day-1 returns to absurd values;
+#   (2) rolling-z-score outlier check — any move > 6× the 60d rolling stddev is
+#       suspicious (scales with each ETF's own volatility, so a Treasury ETF is
+#       held to a tighter bar than a Bitcoin ETF);
+#   (3) reversion check — if a suspicious spike snaps back ≥ 60% within 3 days
+#       it's almost certainly a glitch rather than a real move.
+LISTING_TRIM_WINDOW = 30          # days to scan at the start of the series
+LISTING_TRIM_THRESHOLD = 0.25     # any |return| above this in the window → trim
+ZSCORE_VOL_WINDOW = 60
+ZSCORE_SUSPICIOUS = 6.0
+ZSCORE_EXTREME = 8.0
+REVERSION_WINDOW = 3              # days to look forward after a spike
+REVERSION_FRACTION = 0.60         # net counter-move ≥ this fraction = glitch
 
 
-def _has_dirty_jump(series: pd.Series, threshold: float = DIRTY_1D_THRESHOLD) -> bool:
-    rets = series.pct_change().dropna()
+def clean_price_series(s: pd.Series) -> tuple[pd.Series, str | None]:
+    """Clean a single price series. Returns (possibly-trimmed-series, reason).
+
+    reason is None if the series passed; otherwise a short string explaining why
+    the ETF should be dropped from the universe.
+    """
+    s = s.dropna()
+    if len(s) < 60:
+        return s, "too_short"
+
+    # (1) Trim listing-date artefacts: find the latest big jump within the first
+    # LISTING_TRIM_WINDOW days and start the usable series right after it.
+    early = s.head(LISTING_TRIM_WINDOW).pct_change().abs()
+    bad_early = early[early > LISTING_TRIM_THRESHOLD]
+    if not bad_early.empty:
+        last_bad = bad_early.index[-1]
+        loc = s.index.get_loc(last_bad) + 1
+        s = s.iloc[loc:]
+        if len(s) < 60:
+            return s, "trim_left_too_little"
+
+    rets = s.pct_change().dropna()
     if rets.empty:
-        return False
-    return float(rets.abs().max()) > threshold
+        return s, "no_returns"
+    abs_rets = rets.abs()
+
+    # (2) Rolling z-score: any move > N × rolling stddev is suspect, calibrated
+    # to the ETF's own typical volatility.
+    rolling_std = rets.rolling(ZSCORE_VOL_WINDOW, min_periods=20).std()
+    z = (abs_rets / rolling_std).replace([np.inf, -np.inf], np.nan).dropna()
+    if z.empty:
+        return s, None
+    if z.max() <= ZSCORE_SUSPICIOUS:
+        return s, None  # all moves within tolerance
+
+    # (3) Reversion check on every suspicious day. If the spike snaps back, drop;
+    # otherwise if it's only "suspicious" (6–8σ) it could be real, so allow it.
+    suspicious_days = z[z > ZSCORE_SUSPICIOUS].index
+    for idx in suspicious_days:
+        loc = rets.index.get_loc(idx)
+        spike = float(rets.iloc[loc])
+        after = rets.iloc[loc + 1 : loc + 1 + REVERSION_WINDOW]
+        if not after.empty:
+            net_after = float(after.sum())
+            # Opposite-signed move that recovers ≥ REVERSION_FRACTION of the spike
+            if spike * net_after < 0 and abs(net_after) >= REVERSION_FRACTION * abs(spike):
+                return s, f"reverting_spike_{spike:+.0%}"
+        if z.loc[idx] > ZSCORE_EXTREME:
+            return s, f"extreme_outlier_{float(z.loc[idx]):.1f}sigma"
+    return s, None
 
 
 def filter_dirty_universe(merged: pd.DataFrame, prices: pd.DataFrame,
-                          threshold: float = DIRTY_1D_THRESHOLD,
-                          ) -> tuple[pd.DataFrame, list[dict]]:
-    """Drop ETFs whose price series contains implausible single-day moves
-    (splits, dividend errors, stale prints). Returns (clean_merged, dropped[])."""
+                          ) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
+    """Apply clean_price_series across the universe.
+
+    Returns (clean_merged, clean_prices, dropped[]). `clean_prices` is the same
+    shape as `prices` but trimmed series have NaNs in their listing-window
+    rows — every downstream consumer uses `.dropna()` so this is safe.
+    """
     dropped: list[dict] = []
     keep: list[bool] = []
+    trimmed_cols: dict[str, pd.Series] = {}
+    trim_count = 0
     for _, row in merged.iterrows():
         tkr = row.get("yahoo_ticker") or ""
         if not tkr or tkr not in prices.columns:
             keep.append(True)
             continue
-        s = prices[tkr].dropna()
-        if _has_dirty_jump(s, threshold):
-            max_jump = float(s.pct_change().dropna().abs().max())
+        raw = prices[tkr]
+        cleaned, reason = clean_price_series(raw)
+        if reason:
+            max_jump = float(raw.dropna().pct_change().dropna().abs().max() or 0)
             dropped.append({
                 "isin": row.get("isin"),
                 "name": row.get("name"),
                 "ticker": tkr,
+                "reason": reason,
                 "max_1d_return": round(max_jump, 4),
             })
             keep.append(False)
-        else:
-            keep.append(True)
-    return merged.loc[keep].reset_index(drop=True), dropped
+            continue
+        keep.append(True)
+        if len(cleaned) < len(raw.dropna()):
+            trim_count += 1
+            trimmed_cols[tkr] = cleaned.reindex(prices.index)
+
+    clean_prices = prices.copy()
+    for tkr, col in trimmed_cols.items():
+        clean_prices[tkr] = col
+    clean_merged = merged.loc[keep].reset_index(drop=True)
+    print(f"  trimmed listing window for {trim_count} ETFs (front-of-series NaN'd)")
+    return clean_merged, clean_prices, dropped
 
 
 def _is_clean_series(s: pd.Series) -> bool:
