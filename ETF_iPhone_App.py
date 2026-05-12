@@ -248,6 +248,8 @@ ZSCORE_SUSPICIOUS = 6.0
 ZSCORE_EXTREME = 8.0
 REVERSION_WINDOW = 3              # days to look forward after a spike
 REVERSION_FRACTION = 0.60         # net counter-move ≥ this fraction = glitch
+ABS_DROP_THRESHOLD = 0.25         # any |1-day return| above this = drop, no questions asked
+END_OF_SERIES_WINDOW = 3          # spikes within last N days have no future data → can't reversion-check
 
 
 def clean_price_series(s: pd.Series) -> tuple[pd.Series, str | None]:
@@ -276,25 +278,37 @@ def clean_price_series(s: pd.Series) -> tuple[pd.Series, str | None]:
         return s, "no_returns"
     abs_rets = rets.abs()
 
-    # (2) Rolling z-score: any move > N × rolling stddev is suspect, calibrated
-    # to the ETF's own typical volatility.
-    rolling_std = rets.rolling(ZSCORE_VOL_WINDOW, min_periods=20).std()
-    z = (abs_rets / rolling_std).replace([np.inf, -np.inf], np.nan).dropna()
+    # (2a) Hard absolute backstop: a single-day move > ABS_DROP_THRESHOLD
+    # is essentially never legitimate for a UCITS ETF (leveraged products are
+    # excluded upstream). Catches end-of-series glitches and any error the
+    # statistical checks below might miss.
+    big_abs = abs_rets[abs_rets > ABS_DROP_THRESHOLD]
+    if not big_abs.empty:
+        worst_day = big_abs.idxmax()
+        return s, f"absolute_jump_{float(rets.loc[worst_day]):+.0%}"
+
+    # (2b) Rolling z-score using the *prior* day's window so the denominator
+    # isn't diluted by the spike itself. Catches real outliers in proper context.
+    prior_std = rets.shift(1).rolling(ZSCORE_VOL_WINDOW, min_periods=20).std()
+    z = (abs_rets / prior_std).replace([np.inf, -np.inf], np.nan).dropna()
     if z.empty:
         return s, None
     if z.max() <= ZSCORE_SUSPICIOUS:
-        return s, None  # all moves within tolerance
+        return s, None
 
-    # (3) Reversion check on every suspicious day. If the spike snaps back, drop;
-    # otherwise if it's only "suspicious" (6–8σ) it could be real, so allow it.
+    # (3) Reversion check on suspicious days; end-of-series spikes drop without
+    # needing a reversion (no future data to confirm).
     suspicious_days = z[z > ZSCORE_SUSPICIOUS].index
+    last_idx = len(rets) - 1
     for idx in suspicious_days:
         loc = rets.index.get_loc(idx)
         spike = float(rets.iloc[loc])
+        days_remaining = last_idx - loc
+        if days_remaining < END_OF_SERIES_WINDOW:
+            return s, f"eos_spike_{spike:+.0%}"
         after = rets.iloc[loc + 1 : loc + 1 + REVERSION_WINDOW]
         if not after.empty:
             net_after = float(after.sum())
-            # Opposite-signed move that recovers ≥ REVERSION_FRACTION of the spike
             if spike * net_after < 0 and abs(net_after) >= REVERSION_FRACTION * abs(spike):
                 return s, f"reverting_spike_{spike:+.0%}"
         if z.loc[idx] > ZSCORE_EXTREME:
