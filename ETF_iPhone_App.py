@@ -722,7 +722,7 @@ def compute_factor_exposure(prices: pd.Series, ff_returns: dict[str, dict[str, f
     """OLS regression of ETF monthly returns on FF factors. Returns betas + r2."""
     if prices is None or len(prices.dropna()) < 36:
         return None
-    monthly = prices.resample("M").last().dropna()
+    monthly = prices.resample("ME").last().dropna()
     if len(monthly) < 24:
         return None
     rets = monthly.pct_change().dropna()
