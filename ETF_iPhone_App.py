@@ -134,6 +134,7 @@ def build_etf_records(
     holdings_by_ticker: dict[str, list[dict]] | None = None,
     aum_by_ticker: dict[str, float | None] | None = None,
     ff_returns: dict[str, dict[str, float]] | None = None,
+    tech_by_ticker: dict[str, dict] | None = None,
 ) -> list[dict]:
     records = []
     for row in merged.itertuples(index=False):
@@ -153,6 +154,7 @@ def build_etf_records(
                 drawdowns = top_drawdowns_for_series(series, top_n=5)
                 if ff_returns:
                     factor_exposure = compute_factor_exposure(series, ff_returns)
+        tech = (tech_by_ticker or {}).get(ticker)
         records.append({
             **meta,
             "metrics": metrics,
@@ -162,6 +164,7 @@ def build_etf_records(
             "aum": aum,
             "factor_exposure": factor_exposure,
             "drawdowns": drawdowns,
+            "technicals": tech,
         })
     return records
 
@@ -177,11 +180,15 @@ def write_bundle(merged: pd.DataFrame, prices: pd.DataFrame, stats, out_dir: Pat
     print("\n== Fama-French (for per-ETF factor regression) ==")
     home_static = build_homepage_static(merged, prices)
     ff_returns = _ff_factor_returns(home_static.get("factors"))
+    print("\n== Technicals (RSI, BB, MACD, ADX, rolling Sharpe, SMA crosses) ==")
+    tech_leaderboards, tech_by_ticker = build_technicals_leaderboards(merged, prices)
+    home_static["technicals"] = tech_leaderboards
     bundle = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "universe_stats": asdict(stats),
         "categories": build_categories_summary(merged),
-        "etfs": build_etf_records(merged, prices, holdings_by_ticker, aum_by_ticker, ff_returns),
+        "etfs": build_etf_records(merged, prices, holdings_by_ticker, aum_by_ticker,
+                                  ff_returns, tech_by_ticker),
         "holdings_index": holdings_index,
         "home": home_static,
     }
@@ -763,6 +770,231 @@ def compute_factor_exposure(prices: pd.Series, ff_returns: dict[str, dict[str, f
         "r2": round(r2, 4) if r2 is not None else None,
         "n_months": int(len(df)),
     }
+
+
+# ============================================================================
+# Technical indicators + signal detection
+# ============================================================================
+#
+# For each ETF we compute a compact "technicals" block:
+#   rsi_14, bb_pct (price position in Bollinger 20/2σ), macd_hist, macd_cross,
+#   golden_cross_days, death_cross_days, adx_14, rolling_sharpe_3m,
+#   rolling_sharpe_6m, days_since_52w_high, days_since_52w_low,
+#   signals: ["rsi_overbought" | "rsi_oversold" | "golden_cross_recent" |
+#             "death_cross_recent" | "bollinger_upper" | "bollinger_lower" |
+#             "macd_bullish_cross" | "macd_bearish_cross" |
+#             "new_52w_high" | "new_52w_low" | "strong_trend"]
+#
+# Plus top-level leaderboards in home.technicals (top N per category).
+
+RECENT_CROSS_DAYS = 30
+NEW_HIGH_LOW_DAYS = 5
+
+
+def _ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
+
+
+def _rsi(s: pd.Series, length: int = 14) -> pd.Series:
+    delta = s.diff()
+    up = delta.clip(lower=0)
+    down = (-delta).clip(lower=0)
+    roll_up = up.ewm(alpha=1 / length, adjust=False).mean()
+    roll_down = down.ewm(alpha=1 / length, adjust=False).mean()
+    rs = roll_up / roll_down
+    return 100 - (100 / (1 + rs))
+
+
+def _bollinger_pct(s: pd.Series, length: int = 20, std_mult: float = 2.0) -> pd.Series:
+    mid = s.rolling(length).mean()
+    sd = s.rolling(length).std()
+    upper = mid + std_mult * sd
+    lower = mid - std_mult * sd
+    return (s - lower) / (upper - lower)  # 0 = lower band, 1 = upper band
+
+
+def _macd(s: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    line = _ema(s, fast) - _ema(s, slow)
+    sig = _ema(line, signal)
+    hist = line - sig
+    return line, sig, hist
+
+
+def _adx(close: pd.Series, length: int = 14) -> pd.Series:
+    # No high/low for our cached close-only series — approximate via abs return
+    # ATR. Acceptable for screening but not a precise ADX.
+    tr = close.diff().abs()
+    atr = tr.ewm(alpha=1 / length, adjust=False).mean()
+    plus_dm = close.diff().clip(lower=0)
+    minus_dm = (-close.diff()).clip(lower=0)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / length, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / length, adjust=False).mean() / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=1 / length, adjust=False).mean()
+
+
+def _days_since_cross(a: pd.Series, b: pd.Series, upward: bool) -> int | None:
+    """Return number of days since the most recent a-crosses-b event in the
+    given direction (upward = a moves above b). None if never crossed in series."""
+    diff = a - b
+    sign = np.sign(diff.fillna(0))
+    flip = sign.diff()
+    targets = flip > 0 if upward else flip < 0
+    idx = np.where(targets.values)[0]
+    if len(idx) == 0:
+        return None
+    return int(len(a) - 1 - idx[-1])
+
+
+def _rolling_sharpe(returns: pd.Series, window: int, rf_annual: float = 0.02) -> pd.Series:
+    rf_d = rf_annual / 252
+    excess = returns - rf_d
+    mean = excess.rolling(window).mean()
+    std = excess.rolling(window).std()
+    return (mean / std) * math.sqrt(252)
+
+
+def compute_technicals_for_ticker(prices: pd.Series) -> dict | None:
+    s = prices.dropna()
+    if len(s) < 220:
+        return None
+
+    rets = s.pct_change()
+    rsi = _rsi(s, 14).iloc[-1]
+    bb = _bollinger_pct(s, 20, 2).iloc[-1]
+    macd_line, macd_sig, macd_hist_s = _macd(s)
+    macd_hist = macd_hist_s.iloc[-1]
+    macd_up = _days_since_cross(macd_line, macd_sig, upward=True)
+    macd_down = _days_since_cross(macd_line, macd_sig, upward=False)
+
+    sma50 = s.rolling(50).mean()
+    sma200 = s.rolling(200).mean()
+    golden = _days_since_cross(sma50, sma200, upward=True)
+    death = _days_since_cross(sma50, sma200, upward=False)
+
+    adx_val = _adx(s, 14).iloc[-1] if len(s) > 28 else float("nan")
+    rs_3m = _rolling_sharpe(rets, 63).iloc[-1] if len(rets) > 63 else float("nan")
+    rs_6m = _rolling_sharpe(rets, 126).iloc[-1] if len(rets) > 126 else float("nan")
+
+    last_pos = len(s) - 1
+    high_252_idx = int(s.tail(252).values.argmax())
+    low_252_idx = int(s.tail(252).values.argmin())
+    days_since_high = (252 - 1) - high_252_idx if len(s) >= 252 else None
+    days_since_low = (252 - 1) - low_252_idx if len(s) >= 252 else None
+
+    signals: list[str] = []
+    if pd.notna(rsi):
+        if rsi > 70: signals.append("rsi_overbought")
+        elif rsi < 30: signals.append("rsi_oversold")
+    if pd.notna(bb):
+        if bb > 1.0: signals.append("bollinger_upper")
+        elif bb < 0.0: signals.append("bollinger_lower")
+    if macd_up is not None and macd_up <= 3 and (macd_down is None or macd_down > macd_up):
+        signals.append("macd_bullish_cross")
+    if macd_down is not None and macd_down <= 3 and (macd_up is None or macd_up > macd_down):
+        signals.append("macd_bearish_cross")
+    if golden is not None and golden <= RECENT_CROSS_DAYS and (death is None or death > golden):
+        signals.append("golden_cross_recent")
+    if death is not None and death <= RECENT_CROSS_DAYS and (golden is None or golden > death):
+        signals.append("death_cross_recent")
+    if days_since_high is not None and days_since_high <= NEW_HIGH_LOW_DAYS:
+        signals.append("new_52w_high")
+    if days_since_low is not None and days_since_low <= NEW_HIGH_LOW_DAYS:
+        signals.append("new_52w_low")
+    if pd.notna(adx_val) and adx_val > 25:
+        signals.append("strong_trend")
+
+    return {
+        "rsi_14": _round(rsi, 2),
+        "bb_pct": _round(bb, 3),
+        "macd_hist": _round(macd_hist, 5),
+        "macd_cross_up_days": macd_up,
+        "macd_cross_down_days": macd_down,
+        "golden_cross_days": golden,
+        "death_cross_days": death,
+        "adx_14": _round(adx_val, 2),
+        "rolling_sharpe_3m": _round(rs_3m, 3),
+        "rolling_sharpe_6m": _round(rs_6m, 3),
+        "days_since_52w_high": days_since_high,
+        "days_since_52w_low": days_since_low,
+        "signals": signals,
+    }
+
+
+def build_technicals_leaderboards(merged: pd.DataFrame, prices: pd.DataFrame,
+                                  per_list: int = 12) -> tuple[dict, dict[str, dict]]:
+    """Returns (leaderboards, by_ticker)."""
+    by_ticker: dict[str, dict] = {}
+    for r in merged.itertuples(index=False):
+        d = r._asdict()
+        if d.get("leveraged"):
+            continue
+        tkr = d.get("yahoo_ticker") or ""
+        if not tkr or tkr not in prices.columns:
+            continue
+        tech = compute_technicals_for_ticker(prices[tkr])
+        if not tech:
+            continue
+        by_ticker[tkr] = tech
+
+    # Helper to build a ranked entry list for each leaderboard
+    isin_by_tkr = dict(zip(merged["yahoo_ticker"], merged["isin"]))
+    name_by_tkr = dict(zip(merged["yahoo_ticker"], merged["name"]))
+    cat_by_tkr = dict(zip(merged["yahoo_ticker"], merged["category"]))
+    ac_by_tkr = dict(zip(merged["yahoo_ticker"], merged["asset_class"]))
+
+    def _entry(tkr: str, value: float | int | None, extra_key: str | None = None) -> dict:
+        e = {
+            "isin": isin_by_tkr.get(tkr),
+            "name": name_by_tkr.get(tkr),
+            "category": cat_by_tkr.get(tkr),
+            "asset_class": ac_by_tkr.get(tkr),
+            "value": value,
+        }
+        if extra_key:
+            e["extra"] = by_ticker[tkr].get(extra_key)
+        return e
+
+    def _rank(key: str, *, desc: bool, filter_fn=None, limit: int = per_list) -> list[dict]:
+        rows = []
+        for tkr, tech in by_ticker.items():
+            v = tech.get(key)
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                continue
+            if filter_fn and not filter_fn(tech):
+                continue
+            rows.append((tkr, v))
+        rows.sort(key=lambda x: x[1], reverse=desc)
+        return [_entry(tkr, val) for tkr, val in rows[:limit]]
+
+    def _signal_list(sig: str, sort_key: str | None = None, desc: bool = True,
+                     limit: int = per_list) -> list[dict]:
+        rows = []
+        for tkr, tech in by_ticker.items():
+            if sig not in (tech.get("signals") or []):
+                continue
+            v = tech.get(sort_key) if sort_key else 0
+            rows.append((tkr, v if v is not None else 0))
+        rows.sort(key=lambda x: x[1], reverse=desc)
+        return [_entry(tkr, val) for tkr, val in rows[:limit]]
+
+    leaderboards = {
+        "top_rolling_sharpe_3m": _rank("rolling_sharpe_3m", desc=True),
+        "top_rolling_sharpe_6m": _rank("rolling_sharpe_6m", desc=True),
+        "overbought":            _signal_list("rsi_overbought", sort_key="rsi_14", desc=True),
+        "oversold":              _signal_list("rsi_oversold",   sort_key="rsi_14", desc=False),
+        "golden_crosses_recent": _signal_list("golden_cross_recent", sort_key="golden_cross_days", desc=False),
+        "death_crosses_recent":  _signal_list("death_cross_recent",  sort_key="death_cross_days",  desc=False),
+        "bollinger_breakouts":   _signal_list("bollinger_upper", sort_key="bb_pct", desc=True),
+        "bollinger_breakdowns":  _signal_list("bollinger_lower", sort_key="bb_pct", desc=False),
+        "macd_bullish_crosses":  _signal_list("macd_bullish_cross", sort_key="macd_cross_up_days", desc=False),
+        "new_52w_highs":         _signal_list("new_52w_high", sort_key="days_since_52w_high", desc=False),
+        "new_52w_lows":          _signal_list("new_52w_low",  sort_key="days_since_52w_low",  desc=False),
+        "strong_trends":         _signal_list("strong_trend", sort_key="adx_14", desc=True),
+    }
+    print(f"  technicals: {len(by_ticker)} ETFs analysed; "
+          + ", ".join(f"{k}={len(v)}" for k, v in leaderboards.items()))
+    return leaderboards, by_ticker
 
 
 def build_homepage_static(merged: pd.DataFrame, prices: pd.DataFrame) -> dict:
