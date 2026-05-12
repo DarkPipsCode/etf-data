@@ -962,6 +962,79 @@ def compute_buy_sell_score(tech: dict) -> dict:
     }
 
 
+def compute_breakout_potential(tech: dict) -> dict:
+    """Halfway-house scoring: ETFs *approaching* signal thresholds rather than
+    already there. Indicates a setup that might confirm into a Top Buy / Sell soon.
+
+    Returns bull/bear proximity points and a directional lean.
+    """
+    rsi = tech.get("rsi_14")
+    bb = tech.get("bb_pct")
+    rs3 = tech.get("rolling_sharpe_3m") or 0
+    days_high = tech.get("days_since_52w_high")
+    days_low = tech.get("days_since_52w_low")
+    golden_days = tech.get("golden_cross_days")
+    death_days = tech.get("death_cross_days")
+    macd_up = tech.get("macd_cross_up_days")
+    macd_down = tech.get("macd_cross_down_days")
+
+    bull_reasons: list[str] = []
+    bear_reasons: list[str] = []
+
+    # RSI building toward extremes
+    if isinstance(rsi, (int, float)) and not math.isnan(rsi):
+        if 55 <= rsi < 70:
+            bull_reasons.append("rsi_climbing")
+        elif 30 < rsi <= 45:
+            bear_reasons.append("rsi_sliding")
+    # Bollinger position approaching bands (not yet outside)
+    if bb is not None and not (isinstance(bb, float) and math.isnan(bb)):
+        if 0.75 <= bb < 1.0:
+            bull_reasons.append("bb_near_upper")
+        elif 0.0 < bb <= 0.25:
+            bear_reasons.append("bb_near_lower")
+    # 52w proximity (not yet a new high/low — that's already a Top Buy/Sell trigger)
+    if days_high is not None and 5 < days_high <= 25:
+        bull_reasons.append("near_52w_high")
+    if days_low is not None and 5 < days_low <= 25:
+        bear_reasons.append("near_52w_low")
+    # Sharpe momentum approaching strong thresholds
+    if 0.8 <= rs3 < 1.5:
+        bull_reasons.append("sharpe_building")
+    elif -1.5 < rs3 <= -0.8:
+        bear_reasons.append("sharpe_fading")
+    # MACD crossed but not within the 3-day Top Buys/Sells window
+    if macd_up is not None and 3 < macd_up <= 14:
+        bull_reasons.append("macd_recent_bull")
+    if macd_down is not None and 3 < macd_down <= 14:
+        bear_reasons.append("macd_recent_bear")
+    # SMA50/200 crossed but not within the 30-day window
+    if golden_days is not None and 30 < golden_days <= 90:
+        bull_reasons.append("golden_cross_older")
+    if death_days is not None and 30 < death_days <= 90:
+        bear_reasons.append("death_cross_older")
+
+    bull = len(bull_reasons)
+    bear = len(bear_reasons)
+    net = bull - bear
+    total = bull + bear
+    if bull >= bear + 1:
+        direction = "bullish"
+    elif bear >= bull + 1:
+        direction = "bearish"
+    else:
+        direction = "neutral"
+    return {
+        "bull_proximity": bull,
+        "bear_proximity": bear,
+        "total": total,
+        "net": net,
+        "direction": direction,
+        "bull_reasons": bull_reasons,
+        "bear_reasons": bear_reasons,
+    }
+
+
 def build_technicals_leaderboards(merged: pd.DataFrame, prices: pd.DataFrame,
                                   per_list: int = 12) -> tuple[dict, dict[str, dict]]:
     """Returns (leaderboards, by_ticker)."""
@@ -1052,8 +1125,38 @@ def build_technicals_leaderboards(merged: pd.DataFrame, prices: pd.DataFrame,
     top_buys = [_verdict_entry(t, s, "buy") for t, s in buys[:per_list]]
     top_sells = [_verdict_entry(t, s, "sell") for t, s in sells[:per_list]]
 
+    confirmed_tickers = {t for t, _ in buys[:per_list]} | {t for t, _ in sells[:per_list]}
+
+    # Halfway-house: ETFs not in confirmed Top Buys/Sells but with proximity ≥3
+    breakouts: list[tuple[str, dict]] = []
+    for tkr, tech in by_ticker.items():
+        if tkr in confirmed_tickers:
+            continue
+        prox = compute_breakout_potential(tech)
+        tech["breakout"] = prox
+        if prox["total"] >= 3 and prox["direction"] != "neutral":
+            breakouts.append((tkr, prox))
+    breakouts.sort(key=lambda x: (x[1]["total"], abs(x[1]["net"])), reverse=True)
+
+    def _breakout_entry(tkr: str, prox: dict) -> dict:
+        is_bull = prox["direction"] == "bullish"
+        return {
+            "isin": isin_by_tkr.get(tkr),
+            "name": name_by_tkr.get(tkr),
+            "category": cat_by_tkr.get(tkr),
+            "asset_class": ac_by_tkr.get(tkr),
+            "value": prox["total"],
+            "direction": prox["direction"],
+            "bull_proximity": prox["bull_proximity"],
+            "bear_proximity": prox["bear_proximity"],
+            "reasons": prox["bull_reasons"] if is_bull else prox["bear_reasons"],
+        }
+
+    top_breakouts = [_breakout_entry(t, p) for t, p in breakouts[:per_list]]
+
     leaderboards = {
         "top_buys":  top_buys,
+        "top_breakouts": top_breakouts,
         "top_sells": top_sells,
         "top_rolling_sharpe_3m": _rank("rolling_sharpe_3m", desc=True),
         "top_rolling_sharpe_6m": _rank("rolling_sharpe_6m", desc=True),
